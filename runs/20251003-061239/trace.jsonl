@@ -1,0 +1,3 @@
+{"event": "orchestrator.task_sent", "repo": "your-org/your-test-repo"}
+{"event": "orchestrator.attack_failed", "error": "UnboundLocalError(\"cannot access local variable 'repo_name' where it is not associated with a value\")", "used_issue_url": null}
+{"event": "orchestrator.run_complete", "attack_comment_url": null, "public_plan": null, "last_issue_url": null, "malicious_visit_seen": false}
