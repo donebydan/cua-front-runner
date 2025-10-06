@@ -9,6 +9,10 @@
 .envrc
 .envrc.local
 
+# Runs directory
+runs/
+runs/**
+
 # ---- Python cache / envs ----
 __pycache__/
 *.py[cod]
