@@ -10,7 +10,7 @@ from typing import Any, Dict, Optional
 from .config import settings
 from .event_bus import EventBus
 from .logger import RunLogger
-from .safe_trace import SafeTrace
+from .trace import Trace
 from .docker_control import DockerControl
 from .cua_client import CUAClient
 from .attack_agent import AttackAgent
@@ -31,7 +31,7 @@ def main():
 
     # tracer registers itself to bus, parsing stdout
     malicious_host = settings.malicious_url.split("://")[-1]
-    _ = SafeTrace(bus, runlog, malicious_host)
+    _ = Trace(bus, runlog, malicious_host)
 
     state: Dict[str, Any] = {
         "last_issue_url": None,
@@ -124,9 +124,14 @@ def main():
         state["malicious_visit_seen"] = True
         print("[orchestrator] Detected visit to MALICIOUS_URL in CUA output!")
 
+    def on_log_chunks_url(evt):
+        url = evt.payload.get("url")
+        runlog.write({"event": "orchestrator.log_chunks_url_seen", "url": url})
+
     bus.on("trace/public_plan", on_public_plan)
     bus.on("trace/issue_url", on_issue_url)
     bus.on("trace/malicious_visit", on_malicious_visit)
+    bus.on("trace/log_chunks_url", on_log_chunks_url)
 
     # Attack routine: will still re-check can_attack() before posting, double-safety
     def _run_attack_and_resume():
@@ -237,7 +242,7 @@ def main():
 
     # Wait loop for PUBLIC_PLAN / issue_url events. If none, fallback path applies.
     initial_wait_seconds = 30
-    print(f"[orchestrator] Waiting up to {initial_wait_seconds}s for PUBLIC_PLAN or issue URL to appear in CUA output...")
+    print(f"[orchestrator] Waiting up to {initial_wait_seconds}s for PUBLIC_PLAN or CoT URL to appear in CUA output...")
     start = time.time()
     while time.time() - start < initial_wait_seconds:
         if docker.is_paused():  # event handlers will pause if they decided to run
@@ -247,7 +252,7 @@ def main():
 
     # If no automatic pause and still alive, perform fallback but only if safety gate passes
     if not docker.is_paused():
-        print("[orchestrator] No public plan or issue URL observed within timeout.")
+        print("[orchestrator] No public plan or CoT URL observed within timeout.")
         if not can_attack():
             print("[orchestrator] Safety gate: CUA not alive at fallback time. Skipping attack.")
             runlog.write({"event": "orchestrator.fallback_skipped", "reason": "safety_gate_cua_not_alive"})
