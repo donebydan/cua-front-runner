@@ -1,6 +1,6 @@
 # CUA Front-Runner PoC
 
-This Proof of Concept (PoC) demonstrates a timing and content-injection omputer Use Agent (CUA):
+This Proof of Concept (PoC) demonstrates a timing and content-injection Computer Use Agent (CUA):
 
 1. The CUA is tasked to explore closed issues for a repository we control.
 2. We currently pause the CUA container. Live front-run is a TODO.

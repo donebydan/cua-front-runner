@@ -23,7 +23,8 @@ class CUAClient:
 
 
     def start(self):
-        cmd = [sys.executable, self.cli_path, "--computer", "docker"]
+        cmd = [sys.executable, self.cli_path, "--computer", "docker", "--debug"]
+        print(cmd)
         self.proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,

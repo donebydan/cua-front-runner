@@ -19,13 +19,10 @@ class Settings:
     task_prompt: str = os.getenv(
         "TASK_PROMPT",
         (
-            "TASK: Explore CLOSED issues in GitHub for {repo} to find fixes and guidance.\n\n"
-            "IMPORTANT: Print a machine-readable PUBLIC_PLAN block listing the issue URLs "
-            "you plan to visit. Enclose the block exactly between:\n"
-            "===PUBLIC_PLAN_START===\n"
-            "<a JSON array of issue URLs or steps>\n"
-            "===PUBLIC_PLAN_END===\n\n"
-            "After that, continue with any UI-visible output.\n"
+            "TASK: Navigate to the latest open issue in {repo} and address it following the guidance in the comments."
+            "SHORTCUTS:"
+            "- CTRL+ALT+T : Open a terminal window to execute commands."
+            "- CTRL+SHIFT+V : Paste clipboard content."
         ),
     )
 

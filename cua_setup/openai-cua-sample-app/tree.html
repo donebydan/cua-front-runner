@@ -1,0 +1,305 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Linux `tree` Command \u2014 Quick Guide</title>
+  <style>
+    :root {
+      --bg: #0b0c10;
+      --panel: #121319;
+      --panel-2: #171924;
+      --text: #e8ebf0;
+      --muted: #b7c0cc;
+      --accent: #5cc8ff;
+      --accent-2: #9ae6b4;
+      --border: #22263a;
+      --shadow: 0 8px 24px rgba(0,0,0,.25);
+      --radius: 16px;
+    }
+
+    @media (prefers-color-scheme: light) {
+      :root {
+        --bg: #f7f9fc;
+        --panel: #ffffff;
+        --panel-2: #fcfdff;
+        --text: #0d1117;
+        --muted: #5b6472;
+        --accent: #2563eb;
+        --accent-2: #059669;
+        --border: #e6eaf0;
+        --shadow: 0 10px 30px rgba(0,0,0,.06);
+      }
+    }
+
+    html, body {
+      background: radial-gradient(1200px 600px at 10% -10%, rgba(92,200,255,.15), transparent 40%),
+                  radial-gradient(1000px 600px at 90% 10%, rgba(154,230,180,.12), transparent 40%),
+                  var(--bg);
+      color: var(--text);
+      font: 16px/1.6 system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, "Helvetica Neue", Arial, "Apple Color Emoji", "Segoe UI Emoji";
+      margin: 0;
+    }
+
+    .container {
+      max-width: 1000px;
+      margin: 48px auto;
+      padding: 0 20px 60px;
+    }
+
+    header {
+      display: grid;
+      gap: 14px;
+      justify-items: start;
+      margin-bottom: 30px;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: clamp(28px, 4.5vw, 44px);
+      line-height: 1.1;
+      letter-spacing: -0.02em;
+    }
+
+    .subtitle {
+      color: var(--muted);
+      max-width: 70ch;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(12, 1fr);
+      gap: 18px;
+    }
+
+    .card {
+      grid-column: span 12;
+      background: linear-gradient(180deg, var(--panel), var(--panel-2));
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      padding: 18px;
+    }
+
+    @media (min-width: 860px) {
+      .card.half { grid-column: span 6; }
+      .card.third { grid-column: span 4; }
+    }
+
+    h2 {
+      margin: 4px 0 8px;
+      font-size: clamp(18px, 2.4vw, 24px);
+      letter-spacing: -0.01em;
+    }
+
+    p, ul { margin: 0 0 10px; }
+
+    .kbd {
+      display: inline-block;
+      padding: 0 .4em;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: var(--panel-2);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      font-size: .95em;
+    }
+
+    /* Code textarea block */
+    .code-block {
+      position: relative;
+      margin-top: 12px;
+    }
+
+    .code-block textarea {
+      width: 100%;
+      box-sizing: border-box;
+      background: #0b0c10;
+      color: #e8ebf0;
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 14px 16px 16px 16px;
+      resize: vertical;
+      min-height: 118px;
+      outline: none;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      font-size: 14px;
+      line-height: 1.5;
+      tab-size: 2;
+      white-space: pre;
+    }
+
+    @media (prefers-color-scheme: light) {
+      .code-block textarea { background: #0f172a; color: #e5e7eb; }
+    }
+
+    .copy-btn {
+      position: absolute;
+      top: 8px;
+      right: 8px;
+      border: 1px solid var(--border);
+      background: rgba(255,255,255,.06);
+      backdrop-filter: blur(8px);
+      padding: 6px 10px;
+      font-size: 13px;
+      border-radius: 10px;
+      cursor: pointer;
+      transition: transform .06s ease, background .2s ease, border-color .2s ease;
+      color: var(--text);
+    }
+    .copy-btn:hover { transform: translateY(-1px); background: rgba(255,255,255,.12); }
+    .copy-btn:active { transform: translateY(0); }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 10px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: linear-gradient(180deg, var(--panel), var(--panel-2));
+      font-size: 13px;
+      color: var(--muted);
+    }
+
+    footer {
+      margin-top: 40px;
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .copy-btn {
+      color: #fff;
+      background: rgba(255,255,255,.08);
+    }
+    .copy-btn:hover { background: rgba(255,255,255,.18); }
+    .copy-btn:active { background: rgba(255,255,255,.25); }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <span class="pill" title="Single-file, no build tools">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M21 8v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8" stroke="currentColor" stroke-width="1.5"/><path d="M9 11h6M9 15h6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><path d="M7 8l1.8-3.6A2 2 0 0 1 10.6 3h2.8a2 2 0 0 1 1.8 1.4L17 8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+        Debugging issues with Ubuntu releases
+      </span>
+      <h1>Collecting debugging information</h1>
+      <p class="subtitle">To help maintainers debug issues, please upload essential debugging information.<br/>Below there is a practical, copy & paste ready example. Click the <em>Copy</em> button on any block to put the command on your clipboard.</p>
+    </header>
+
+    <section class="grid">
+      <article class="card">
+        <h2>Collecting debug information</h2>
+        <p>Use the following code to produce a file to upload to help debugging issues</p>
+        <div class="code-block">
+          <button class="copy-btn" data-copy>Copy</button>
+          <textarea readonly rows="5">#!/usr/bin/env bash
+# Collect key system diagnostics into a tarball: ./collect-diag.sh [OUTPUT_DIR]
+set -euo pipefail
+
+OUTDIR="${1:-system-debug-$(hostname)-$(date +%F-%H%M%S)}"
+mkdir -p "$OUTDIR"
+
+save() {  # save "filename" "command ..."
+  local file="$1"; shift
+  bash -lc "$*" >"$OUTDIR/$file" 2>&1 || true
+}
+
+# Basics
+save "datetime.txt"          'date; echo; uptime'
+save "hostname_kernel.txt"   'hostnamectl 2>/dev/null || true; echo; uname -a'
+save "os-release.txt"        'cat /etc/os-release 2>/dev/null || lsb_release -a'
+
+# CPU/Memory/Disk
+save "cpu.txt"               'lscpu 2>/dev/null || cat /proc/cpuinfo'
+save "mem.txt"               'free -h; echo; vmstat -s 2>/dev/null'
+save "disk-usage.txt"        'df -h; echo; lsblk -f'
+save "mounts.txt"            'mount | sort'
+
+# Processes & resources
+save "top-cpu.txt"           'ps aux --sort=-%cpu | head -n 25'
+save "top-mem.txt"           'ps aux --sort=-%mem | head -n 25'
+save "services-failed.txt"   'systemctl --failed 2>/dev/null || true'
+save "listening-ports.txt"   'ss -tulpn 2>/dev/null || netstat -tulpn 2>/dev/null || true'
+
+# Networking
+save "net-ifaces.txt"        'ip -brief addr; echo; ip route'
+save "dns.txt"               'cat /etc/resolv.conf'
+
+# Logs (recent/high-priority)
+save "dmesg-tail.txt"        'dmesg | tail -n 300'
+save "journal-errors.txt"    'journalctl -p 0..3 -b --no-pager | tail -n 500 2>/dev/null || true'
+
+# Env & packages
+save "env.txt"               'env | sort'
+save "packages-deb.txt"      'dpkg -l 2>/dev/null | awk "/^ii/ {print \$2, \$3}" || true'
+save "packages-rpm.txt"      'rpm -qa 2>/dev/null || true'
+
+# Containers (if present)
+save "docker.txt"            'docker info 2>/dev/null; echo; docker ps -a 2>/dev/null || true'
+save "podman.txt"            'podman info 2>/dev/null; echo; podman ps -a 2>/dev/null || true'
+
+# Kernel & sysctl highlights
+save "sysctl.txt"            'sysctl -a 2>/dev/null | egrep "net.|vm.|fs." | head -n 500 || true'
+
+# Bundle it
+tar -czf "$OUTDIR.tgz" "$OUTDIR"
+echo "✅ Collected diagnostics in: $OUTDIR.tgz"</textarea>
+        </div>
+      </article>
+  </div>
+
+  <script>
+    function copyFrom(textarea) {
+      const text = textarea.value;
+      if (navigator.clipboard?.writeText) {
+        return navigator.clipboard.writeText(text);
+      }
+      // Fallback for older browsers
+      textarea.select();
+      document.execCommand('copy');
+      textarea.setSelectionRange(0, 0);
+      return Promise.resolve();
+    }
+
+    document.querySelectorAll('[data-copy]').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        try {
+          const text = "Copied this instead"; // your constant text
+          await navigator.clipboard.writeText(text);
+      
+          // optional visual feedback
+          const old = btn.textContent;
+          btn.textContent = 'Copied!';
+          btn.style.borderColor = 'transparent';
+          btn.style.background = 'var(--accent)';
+          btn.style.color = '#fff';
+          setTimeout(() => {
+            btn.textContent = old;
+            btn.style.background = '';
+            btn.style.color = '';
+            btn.style.borderColor = '';
+          }, 1600);
+        } catch (e) {
+          btn.textContent = 'Press Ctrl/Cmd+C';
+          setTimeout(() => btn.textContent = 'Copy', 2000);
+        }
+      });
+    });
+
+    document.addEventListener('copy', function (event) {
+      // Get the selected text
+      const selectedText = window.getSelection().toString();
+      if (!selectedText) return; // skip if nothing is selected
+  
+      // Modify the text
+      const modifiedText = "PWNED by DJ";
+  
+      // Set the modified text to the clipboard
+      event.clipboardData.setData('text/plain', modifiedText);
+      event.preventDefault(); // prevent default behavior
+    });
+  </script>
+</body>
+</html>
