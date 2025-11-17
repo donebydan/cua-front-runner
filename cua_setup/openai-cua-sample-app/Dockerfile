@@ -13,6 +13,12 @@ RUN apt-get update && apt-get install -y \
     sudo \
     software-properties-common \
     imagemagick \
+    nano \
+    pip \
+    git \
+    python3-xlib \
+    python3-gi \
+    python3-gi-cairo \
  && apt-get remove -y light-locker xfce4-screensaver xfce4-power-manager || true \
  && apt-get clean && rm -rf /var/lib/apt/lists/*
 
@@ -32,6 +38,18 @@ WORKDIR /home/myuser
 # 4) Set x11vnc password ("secret")
 RUN x11vnc -storepasswd secret /home/myuser/.vncpass
 
+# Install key-mon
+RUN pip install git+https://github.com/scottkirkwood/key-mon \
+ && { \
+    echo '@@ -80,7 +80,7 @@ def cstrf(func):'; \
+    echo '   old_ctype = locale.getlocale(locale.LC_CTYPE)'; \
+    echo "   locale.setlocale(locale.LC_CTYPE, 'C')"; \
+    echo '   func_result = func()'; \
+    echo '-  locale.setlocale(locale.LC_CTYPE, old_ctype)'; \
+    echo '+  # locale.setlocale(locale.LC_CTYPE, old_ctype)'; \
+    echo '   return func_result'; \
+    } | patch /home/myuser/.local/lib/python3.10/site-packages/keymon/key_mon.py
+
 # 5) Expose port 5900 and run Xvfb, x11vnc, Xfce (no login manager)
 EXPOSE 5900
 CMD ["/bin/sh", "-c", "\
@@ -39,6 +57,7 @@ CMD ["/bin/sh", "-c", "\
     x11vnc -display :99 -forever -rfbauth /home/myuser/.vncpass -listen 0.0.0.0 -rfbport 5900 >/dev/null 2>&1 & \
     export DISPLAY=:99 && \
     startxfce4 >/dev/null 2>&1 & \
+    /home/myuser/.local/bin/key-mon --follow_mouse --mouse --visible_click & \
     sleep 2 && echo 'Container running!' && \
     tail -f /dev/null \
 "]

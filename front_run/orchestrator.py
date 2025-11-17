@@ -5,6 +5,7 @@ Orchestrator for the CUA Front-Runner PoC.
 
 import time
 import traceback
+import json
 from typing import Any, Dict, Optional
 
 from .config import settings
@@ -34,9 +35,10 @@ def main():
     _ = Trace(bus, runlog, malicious_host)
 
     state: Dict[str, Any] = {
-        "last_issue_url": None,
         "attack_done": False,
         "malicious_visit_seen": False,
+        "commented": False,
+        "comment_url": None,
     }
 
     # keep a reference to the CUAClient so we can check proc liveness
@@ -99,10 +101,29 @@ def main():
             except Exception:
                 pass
             return
+        
 
-
-    bus.on("process/stderr", on_stdout)
-    bus.on("process/stdout", on_stdout)
+    def on_action(evt):
+        if state["attack_done"]:
+            return
+        action = json.loads(evt.payload.get("text", ""))
+        if action.get("type") == "click":
+            x = action.get("x")
+            y = action.get("y")
+            if x - 150 <= 200 <= x + 150 and y - 20 <= 366 <= y + 20 and not state["commented"]:
+                runlog.write({"event": "CUA wants to navigate to issue", "x": x, "y": y})
+                try:
+                    docker.pause()
+                    attack = AttackAgent()
+                    state["commented"] = True
+                    state["comment_url"] = attack.comment_on_issue(settings.issue_url, settings.target_repo, settings.attacker_comment)
+                    docker.unpause()
+                except Exception as e:
+                    runlog.write({"event": "orchestrator.fallback_pause_failed", "error": repr(e)})
+                    print(f"[orchestrator] Warning: fallback docker.pause() failed: {e}")
+    
+    #bus.on("process/stdout", on_stdout)
+    bus.on("trace/action", on_action)
 
     # Start CUA subprocess
     try:
@@ -137,37 +158,21 @@ def main():
             pass
         return
 
-    time.sleep(120)
-
-    # If no automatic pause and still alive, perform fallback but only if safety gate passes
-    if not docker.is_paused():
-        print("[orchestrator] No public plan or CoT URL observed within timeout.")
-        if not can_attack():
-            print("[orchestrator] Safety gate: CUA not alive at fallback time. Skipping attack.")
-            runlog.write({"event": "orchestrator.fallback_skipped", "reason": "safety_gate_cua_not_alive"})
-        else:
-            print("[orchestrator] Pausing as fallback and running attack.")
-            try:
-                docker.pause()
-            except Exception as e:
-                runlog.write({"event": "orchestrator.fallback_pause_failed", "error": repr(e)})
-                print(f"[orchestrator] Warning: fallback docker.pause() failed: {e}")
-            _run_attack_and_resume()
+    # Wait for the CUA for a reasonable time
+    time.sleep(100)
 
     # Final logging and cleanup
     runlog.write({
         "event": "orchestrator.run_complete",
-        "attack_comment_url": state.get("attack_comment_url"),
-        "public_plan": state.get("public_plan"),
-        "last_issue_url": state.get("last_issue_url"),
-        "malicious_visit_seen": state.get("malicious_visit_seen"),
+        "commented": state.get("commented"),
+        "attack_done": state.get("attack_done"),
     })
     print(f"[orchestrator] Run complete. Trace saved to: {runlog.path()}")
 
-    try:
-        cua.stop(timeout=2)
-    except Exception:
-        pass
+    cua.stop(timeout=2)
+
+    attack = AttackAgent()
+    attack.remove_comment(state["comment_url"])
 
 
 if __name__ == "__main__":
