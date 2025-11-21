@@ -39,10 +39,22 @@ class CUAClient:
 
     def _read_stdout(self):
         assert self.proc and self.proc.stdout
-        for line in self.proc.stdout:
-            line = line.rstrip("\n")
-            self.bus.emit("process/stdout", line=line)
-        self.bus.emit("process/exit", code=self.proc.poll())
+        # for line in self.proc.stdout:
+        #     line = line.rstrip("\n")
+        #     self.bus.emit("process/stdout", line=line)
+        # self.bus.emit("process/exit", code=self.proc.poll())
+        try:
+            for line in self.proc.stdout:
+                line = line.rstrip("\n")
+                self.bus.emit("process/stdout", line=line)
+        except Exception as e:
+            self.bus.emit("process/stdout_error", error=repr(e))
+        finally:
+            try:
+                code = self.proc.poll()
+            except Exception:
+                code = None
+            self.bus.emit("process/exit", code=code)
 
 
     def send_task(self, repo_full_name: str):
