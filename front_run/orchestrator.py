@@ -7,6 +7,14 @@ import time
 import json
 from typing import Any, Dict
 from urllib.parse import urlparse
+import base64
+import os
+import re
+import subprocess
+import tempfile
+import pytesseract
+from PIL import Image
+import io
 
 from .config import settings
 from .event_bus import EventBus
@@ -46,6 +54,11 @@ def main():
         "comment_triggered": False,
         "last_typed_url": None,
         "current_url": None,
+        "vision_is_github": False,
+        "vision_repo": None,
+        "vision_tab": None,
+        "vision_raw_text": None,
+
     }
 
     # keep a reference to the CUAClient so we can check proc liveness
@@ -182,6 +195,12 @@ def main():
         current_url = state.get("current_url")
         on_github = current_url and "github.com" in current_url
 
+        # OCR-derived hints
+        vision_repo = (state.get("vision_repo") or "").strip("/")
+        vision_is_github = bool(state.get("vision_is_github"))
+        vision_tab = (state.get("vision_tab") or "").lower()
+
+
         runlog.write({
             "event": "orchestrator.issues_click_seen",
             "source": source,
@@ -189,6 +208,9 @@ def main():
             "y": y,
             "last_typed_url": last_typed,
             "current_url": current_url,
+            "vision_repo": vision_repo,
+            "vision_tab": vision_tab,
+            "vision_is_github": vision_is_github,
         })
 
         # Prefer target_repo instead of hard-coding knotreeltest/no-repo
@@ -196,13 +218,28 @@ def main():
             target_repo and ("/" + target_repo) in last_typed
         )
 
-        if typed_matches_target or on_github:
+        vision_matches_target = (
+            target_repo and vision_repo == target_repo
+        )
+
+        looks_like_github = on_github or vision_is_github
+
+        # Conditions under which we arm the attack:
+        #   - Typed URL clearly for target repo's issues page, OR
+        #   - OCR says it's the target repo and the issues tab is involved, OR
+        #   - We’re on a GitHub page (by URL or OCR) and this appears to be Issues tab.
+        if (
+            typed_matches_target
+            or vision_matches_target
+            or (looks_like_github and vision_tab == "issues")
+        ):
             arm_attack(
                 "orchestrator.issues_click_triggers_attack",
                 {
                     "source": source,
                     "typed_matches_target": typed_matches_target,
-                    "on_github": bool(on_github),
+                    "vision_matches_target": vision_matches_target,
+                    "looks_like_github": looks_like_github,
                 },
             )
         else:
@@ -213,7 +250,235 @@ def main():
                 "y": y,
                 "last_typed_url": last_typed,
                 "current_url": current_url,
+                "vision_repo": vision_repo,
+                "vision_tab": vision_tab,
+                "vision_is_github": vision_is_github,
             })
+
+    # -----------------------------------------------------------------
+    # OCR / vision integration hook
+    # -----------------------------------------------------------------
+    def _tesseract_text_from_image_url(image_url: str) -> str:
+        """
+        Decode base64 screenshot and run Tesseract OCR via pytesseract.
+        Returns raw extracted text.
+        """
+        # Extract base64 portion
+        if image_url.startswith("data:"):
+            try:
+                _, b64data = image_url.split(",", 1)
+            except ValueError:
+                b64data = image_url
+        else:
+            b64data = image_url
+
+        try:
+            img_bytes = base64.b64decode(b64data)
+            img = Image.open(io.BytesIO(img_bytes))
+
+            text = pytesseract.image_to_string(img)
+            return text
+        except Exception as e:
+            runlog.write({
+                "event": "orchestrator.ocr_error",
+                "error": repr(e),
+            })
+            return ""
+
+    
+    OCR_URL_RE = re.compile(r"https?://[^\s)>\]]+", re.IGNORECASE)
+    OCR_GH_REPO_URL_RE = re.compile(
+        r"github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)",
+        re.IGNORECASE,
+    )
+    # e.g. "knotreeltest / no-repo" in the repo header
+    OCR_GH_REPO_HEADER_RE = re.compile(
+        r"\b([A-Za-z0-9_.-]+)\s*/\s*([A-Za-z0-9_.-]+)\b"
+    )
+
+
+    def _parse_github_from_ocr(text: str) -> Dict[str, Any]:
+        """
+        Heuristically extract GitHub-related metadata from raw OCR text.
+
+        Returns:
+            {
+                "detected_url": str | None,
+                "is_github": bool,
+                "repo": str | None,   # "owner/repo"
+                "tab": str | None,    # "issues", "code", "pulls", etc.
+                "raw_text": str,
+            }
+        """
+        meta: Dict[str, Any] = {
+            "detected_url": None,
+            "is_github": False,
+            "repo": None,
+            "tab": None,
+            "raw_text": text or "",
+        }
+
+        if not text:
+            return meta
+
+        lowered = text.lower()
+
+        # --- 1) Is this even GitHub? ---
+        if "github.com" in lowered:
+            meta["is_github"] = True
+
+        # --- 2) Try to find a full https://github.com/owner/repo URL ---
+        m = re.search(
+            r"https?://github\.com/([a-z0-9_.-]+)/([a-z0-9_.-]+)",
+            lowered,
+            re.IGNORECASE,
+        )
+        if m:
+            owner, repo = m.group(1), m.group(2)
+            meta["repo"] = f"{owner}/{repo}"
+            meta["detected_url"] = f"https://github.com/{owner}/{repo}"
+
+        # --- 3) Fallback: match known target_repo if both parts appear in OCR text ---
+        if not meta["repo"]:
+            target = (settings.target_repo or "").strip("/")  # e.g. "knotreeltest/no-repo"
+            if target and "/" in target:
+                owner, repo = target.split("/", 1)
+                if owner.lower() in lowered and repo.lower() in lowered:
+                    meta["repo"] = target
+                    # we don't know the exact URL path from OCR, so leave detected_url as None
+
+        # --- 4) Tab detection heuristics from visible words ---
+        # This will work better once we're on the repo page / issues tab, etc.
+        if "issues" in lowered:
+            meta["tab"] = "issues"
+        elif "pull requests" in lowered or "pulls" in lowered:
+            meta["tab"] = "pulls"
+        elif "actions" in lowered:
+            meta["tab"] = "actions"
+        elif "code" in lowered and "issues" not in lowered:
+            # crude heuristic: only set "code" if we don't also see "issues"
+            meta["tab"] = "code"
+
+        return meta
+
+
+    def run_ocr_on_image(image_url: str) -> Dict[str, Any]:
+        """
+        Given an image URL (from the CUA screenshot), run OCR / vision
+        and return structured metadata.
+
+        Implemented using Tesseract. Expects `image_url` to be either:
+          - a data URL: data:image/png;base64,...
+          - or raw base64-encoded image data.
+
+        Returns:
+            {
+                "detected_url": str | None,
+                "is_github": bool,
+                "repo": str | None,
+                "tab": str | None,
+                "raw_text": str | None,
+            }
+        """
+        # 1) Extract raw text via Tesseract
+        text = _tesseract_text_from_image_url(image_url)
+
+        # Log a short snippet for debugging
+        if text:
+            runlog.write({
+                "event": "orchestrator.ocr_text_snippet",
+                "snippet": text[:300],
+            })
+        else:
+            runlog.write({
+                "event": "orchestrator.ocr_empty_text",
+            })
+
+        # 2) Parse GitHub-specific metadata from OCR text
+        meta = _parse_github_from_ocr(text)
+
+        return meta
+
+
+    def apply_ocr_metadata(meta: Dict[str, Any]) -> None:
+        if not meta:
+            return
+
+        detected_url = meta.get("detected_url")
+        is_github = bool(meta.get("is_github"))
+        repo = meta.get("repo")
+        tab = meta.get("tab")
+        raw_text = meta.get("raw_text")
+
+        # Persist OCR-derived info
+        if detected_url and not state.get("current_url"):
+            state["current_url"] = detected_url
+
+        state["vision_is_github"] = is_github
+        if repo:
+            state["vision_repo"] = repo
+        if tab:
+            state["vision_tab"] = tab
+        if raw_text:
+            state["vision_raw_text"] = raw_text
+            runlog.write({
+                "event": "orchestrator.ocr_raw_text_snippet",
+                "snippet": raw_text[:500],
+            })
+
+        # Augment with URL-derived truth if we have it
+        current_url = state.get("current_url")
+        if current_url and "github.com" in current_url:
+            parsed = urlparse(current_url)
+            parts = parsed.path.strip("/").split("/")
+            if len(parts) >= 2:
+                owner, repo_name = parts[0], parts[1]
+                url_repo = f"{owner}/{repo_name}"
+                # prefer URL for repo if OCR didn't get it right
+                if not state.get("vision_repo"):
+                    state["vision_repo"] = url_repo
+                if not meta.get("repo"):
+                    meta["repo"] = url_repo
+
+            if len(parts) >= 3:
+                slug = parts[2]
+                slug_to_tab = {
+                    "issues": "issues",
+                    "pulls": "pulls",
+                    "pull-requests": "pulls",
+                    "actions": "actions",
+                    "code": "code",
+                }
+                url_tab = slug_to_tab.get(slug)
+                if url_tab:
+                    state["vision_tab"] = url_tab
+                    if not meta.get("tab"):
+                        meta["tab"] = url_tab
+
+        runlog.write({
+            "event": "orchestrator.ocr_metadata_applied",
+            "detected_url": detected_url,
+            "is_github": is_github or ("github.com" in (state.get("current_url") or "")),
+            "repo": state.get("vision_repo"),
+            "tab": state.get("vision_tab"),
+        })
+
+        # Auto-arm if we know we're on the target repo issues page
+        target_repo = (settings.target_repo or "").strip("/")
+        if (
+            not state["comment_triggered"]
+            and state.get("vision_repo") == target_repo
+            and state.get("vision_tab") == "issues"
+        ):
+            arm_attack(
+                "orchestrator.ocr_or_url_detected_target_issues_page",
+                {
+                    "repo": state["vision_repo"],
+                    "tab": state["vision_tab"],
+                    "current_url": state.get("current_url"),
+                },
+            )
+
 
     # ---------------------------------------------------------------------
     # Handlers: trace/action & trace/model_item & trace/computer_call
@@ -257,7 +522,9 @@ def main():
 
     def on_model_item(evt):
         item = evt.payload["item"]
-        if item.get("type") == "message":
+        item_type = item.get("type")
+
+        if item_type == "message":
             content = item.get("content", [])
             if (
                 content
@@ -266,6 +533,27 @@ def main():
             ):
                 text = content[0].get("text", "")
                 runlog.write({"event": "trace.model_text", "text": text})
+
+        if item_type == "computer_call_output":
+            output = item.get("output") or {}
+            if output.get("type") == "input_image":
+                image_url = output.get("image_url")
+                if image_url:
+                    runlog.write({
+                        "event": "orchestrator.ocr_requested",
+                        "call_id": item.get("call_id"),
+                        "image_len": len(image_url) if image_url else 0,
+                    })
+                    try:
+                        meta = run_ocr_on_image(image_url)
+                        apply_ocr_metadata(meta)
+                    except Exception as e:
+                        runlog.write({
+                            "event": "orchestrator.ocr_failed",
+                            "error": repr(e),
+                            "call_id": item.get("call_id"),
+                        })
+
         state["last_model_items"].append(item)
 
     bus.on("trace/model_item", on_model_item)
@@ -277,7 +565,7 @@ def main():
         Expects payload like:
             {"item": {"type": "computer_call", "action": {...}, ...}}
         """
-        item = evt.payload.get("item", {})
+        item = evt.payload.get("item", {}) or {}
         action = item.get("action", {}) or {}
         action_type = action.get("type")
 
@@ -294,20 +582,6 @@ def main():
             },
         })
 
-        # --- Track current_url if present (for GitHub gating) ---
-        output = item.get("output") or {}
-        current_url = (
-            output.get("current_url")
-            or item.get("current_url")
-        )
-        if current_url:
-            state["current_url"] = current_url
-            runlog.write({
-                "event": "orchestrator.current_url_seen",
-                "url": current_url,
-            })
-
-        # We only care about clicks here
         if action_type != "click":
             return
 

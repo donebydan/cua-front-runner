@@ -52,9 +52,6 @@ class Agent:
             if self.print_steps:
                 print(item["content"][0]["text"])
         
-        if item["type"] == "computer_call":
-            print("TRACE_COMPUTER_CALL " + json.dumps(item))
-
         if item["type"] == "function_call":
             name, args = item["name"], json.loads(item["arguments"])
             if self.print_steps:
@@ -110,6 +107,12 @@ class Agent:
                 current_url = self.computer.get_current_url()
                 check_blocklisted_url(current_url)
                 call_output["output"]["current_url"] = current_url
+            
+            try:
+                print("TRACE_MODEL_ITEM " + json.dumps(sanitize_message(call_output)))
+            except Exception:
+                # don't break the agent if serialization fails
+                pass
 
             return [call_output]
         return []
@@ -122,9 +125,21 @@ class Agent:
         self.show_images = show_images
         new_items = []
 
-        # keep looping until we get a final response
-        while new_items[-1].get("role") != "assistant" if new_items else True:
-            self.debug_print([sanitize_message(msg) for msg in input_items + new_items])
+        max_steps = 50
+        steps = 0
+
+        while True:
+            if new_items and new_items[-1].get("role") == "assistant":
+                break
+
+            if steps >= max_steps:
+                print("Max steps reached in run_full_turn; stopping.")
+                break
+            steps += 1
+
+            self.debug_print(
+                [sanitize_message(msg) for msg in (input_items + new_items)]
+            )
 
             response = create_response(
                 model=self.model,
@@ -137,30 +152,40 @@ class Agent:
             )
             self.debug_print(response)
 
-            if "output" not in response and self.debug:
-                print(response)
-                raise ValueError("No output from model")
-            else:
-                # Print all the keys in the response for debugging
-                outs = response["output"][0]
-                print("Response keys:", outs)
+            if "error" in response and response["error"]:
+                print("Model error:", response["error"])
+                # End the turn gracefully; return what we have so far
+                break
 
-                try:
-                    print(
-                        "TRACE_MODEL_ITEM "
-                        + json.dumps(outs, ensure_ascii=False)
-                    )
-                except Exception:
-                    # don't break the agent if serialization fails
-                    pass
+            outputs = response.get("output") or []
+            if not outputs:
+                if self.debug:
+                    print("Model returned no output:", response)
+                # No more output; end the turn
+                break
 
-                # Print reasoning summary if it exists
-                if "reasoning" in outs and "summary" in outs["reasoning"]:
-                    print("\nReasoning Summary:")
-                    print(outs["reasoning"]["summary"])
+            outs0 = outputs[0]
+            print("Response keys:", outs0)
+            try:
+                sanitized_outs0 = sanitize_message(outs0)
+                print(
+                    "TRACE_MODEL_ITEM "
+                    + json.dumps(sanitized_outs0, ensure_ascii=False)
+                )
+            except Exception:
+                # don't break the agent if serialization fails
+                pass
 
-                new_items += response["output"]
-                for item in response["output"]:
-                    new_items += self.handle_item(item)
+            # Print reasoning summary if present
+            if "reasoning" in outs0 and "summary" in outs0["reasoning"]:
+                print("\nReasoning Summary:")
+                print(outs0["reasoning"]["summary"])
+
+            new_items += outputs
+
+            tool_outputs = []
+            for item in outputs:
+                tool_outputs += self.handle_item(item)
+            new_items += tool_outputs
 
         return new_items
