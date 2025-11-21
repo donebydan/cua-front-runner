@@ -4,9 +4,8 @@ Orchestrator for the CUA Front-Runner PoC.
 """
 
 import time
-import traceback
 import json
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 from urllib.parse import urlparse
 
 from .config import settings
@@ -35,6 +34,9 @@ def main():
     malicious_host = settings.malicious_url.split("://")[-1]
     _ = Trace(bus, runlog, malicious_host)
 
+    # Normalised target repo (e.g. "knotreeltest/no-repo")
+    target_repo = (settings.target_repo or "").strip("/")
+
     state: Dict[str, Any] = {
         "attack_done": False,
         "malicious_visit_seen": False,
@@ -43,35 +45,60 @@ def main():
         "last_model_items": [],
         "comment_triggered": False,
         "last_typed_url": None,
+        "current_url": None,
     }
 
     # keep a reference to the CUAClient so we can check proc liveness
     cua = CUAClient(bus, cli_path=settings.cli_path)
 
+    # ---------------------------------------------------------------------
+    # Safety gate: is it ok to run the attack right now?
+    # ---------------------------------------------------------------------
     def can_attack() -> bool:
         # Container must exist and be either running or paused
         if not docker.is_running():
-            runlog.write({"event": "safety.can_attack", "ok": False, "reason": "container_not_running"})
+            runlog.write({
+                "event": "safety.can_attack",
+                "ok": False,
+                "reason": "container_not_running",
+            })
             return False
 
         # CUAClient must have a subprocess and it must be alive
         if not getattr(cua, "proc", None):
-            runlog.write({"event": "safety.can_attack", "ok": False, "reason": "no_local_cua_proc"})
+            runlog.write({
+                "event": "safety.can_attack",
+                "ok": False,
+                "reason": "no_local_cua_proc",
+            })
             return False
 
         # poll() returns None if process is still running
         try:
             if cua.proc.poll() is not None:
-                runlog.write({"event": "safety.can_attack", "ok": False, "reason": "cua_proc_exited", "return_code": cua.proc.returncode})
+                runlog.write({
+                    "event": "safety.can_attack",
+                    "ok": False,
+                    "reason": "cua_proc_exited",
+                    "return_code": cua.proc.returncode,
+                })
                 return False
         except Exception as e:
-            runlog.write({"event": "safety.can_attack", "ok": False, "reason": "proc_poll_error", "error": repr(e)})
+            runlog.write({
+                "event": "safety.can_attack",
+                "ok": False,
+                "reason": "proc_poll_error",
+                "error": repr(e),
+            })
             return False
 
         # all checks passed
         runlog.write({"event": "safety.can_attack", "ok": True})
         return True
 
+    # ---------------------------------------------------------------------
+    # Basic stdout logging
+    # ---------------------------------------------------------------------
     def on_stdout(evt):
         line = evt.payload.get("line")
         runlog.write({"event": "cua_stdout", "line": line})
@@ -79,51 +106,129 @@ def main():
     bus.on("process/stdout", on_stdout)
 
     def on_stdout_error(evt):
-       runlog.write({
-           "event": "cua_stdout_reader_error",
-           "error": evt.payload.get("error"),
-       })
-       print("[orchestrator] stdout reader error:", evt.payload.get("error"))
+        runlog.write({
+            "event": "cua_stdout_reader_error",
+            "error": evt.payload.get("error"),
+        })
+        print("[orchestrator] stdout reader error:", evt.payload.get("error"))
 
     bus.on("process/stdout_error", on_stdout_error)
 
-    # Attack routine: will still re-check can_attack() before posting, double-safety
-    def _run_attack_and_resume():
-        if state["attack_done"]:
-            print("[orchestrator] Attack already done for this run; skipping.")
+    # ---------------------------------------------------------------------
+    # Shared helpers: URL typing + Issues-click detection
+    # ---------------------------------------------------------------------
+
+    ISSUES_BOX = {"x_min": 111, "x_max": 220, "y_min": 170, "y_max": 253}
+
+    def clicked_any_issues_box(x: int, y: int) -> bool:
+        if (
+            ISSUES_BOX["x_min"] <= x <= ISSUES_BOX["x_max"]
+            and ISSUES_BOX["y_min"] <= y <= ISSUES_BOX["y_max"]
+        ):
+            return True
+        return False
+
+    def arm_attack(reason: str, extra: Dict[str, Any] | None = None) -> None:
+        """Set comment_triggered once, with logging."""
+        if state["comment_triggered"] or state["commented"]:
+            return
+        state["comment_triggered"] = True
+        payload = {"event": reason}
+        if extra:
+            payload.update(extra)
+        runlog.write(payload)
+
+    def handle_typed_text(text: str, source: str) -> None:
+        """Track typed GitHub URLs and arm attack when /issues for target repo."""
+        if not text:
             return
 
-        # Second safety check right before taking any external action
-        if not can_attack():
-            print("[orchestrator] Safety gate failed pre-attack; skipping posting and resuming container.")
-            runlog.write({"event": "orchestrator.attack_aborted_prepost", "reason": "safety_gate_cua_not_alive"})
-            try:
-                # If we paused earlier, attempt to unpause to leave container usable for debugging.
-                if docker.is_paused():
-                    docker.unpause()
-            except Exception:
-                pass
+        if "github.com/" not in text:
             return
+
+        state["last_typed_url"] = text
+        runlog.write({
+            "event": "orchestrator.url_typed",
+            "text": text,
+            "source": source,
+        })
 
         try:
-            attack = AttackAgent()
+            # Normalise to a full URL for parsing
+            url = text if text.startswith("http") else "https://" + text
+            parsed = urlparse(url)
+            path = parsed.path or ""  # e.g. "/knotreeltest/no-repo/issues"
+
+            # Only care if it's the *target repo* and an issues page
+            if target_repo and path.startswith("/" + target_repo) and "/issues" in path:
+                arm_attack(
+                    "orchestrator.issues_url_typed_triggers_attack",
+                    {"typed_url": url, "source": source},
+                )
         except Exception as e:
-            runlog.write({"event": "orchestrator.attack_agent_init_failed", "error": repr(e)})
-            print(f"[orchestrator] Failed to initialize AttackAgent: {e}")
-            try:
-                if docker.is_paused():
-                    docker.unpause()
-            except Exception:
-                pass
-            return
-        
+            runlog.write({
+                "event": "orchestrator.url_parse_error",
+                "text": text,
+                "error": repr(e),
+                "source": source,
+            })
 
+    def handle_issues_click(x: int, y: int, source: str) -> None:
+        """Handle clicks that might correspond to the Issues tab."""
+        if not clicked_any_issues_box(x, y):
+            return
+
+        last_typed = state.get("last_typed_url", "") or ""
+        current_url = state.get("current_url")
+        on_github = current_url and "github.com" in current_url
+
+        runlog.write({
+            "event": "orchestrator.issues_click_seen",
+            "source": source,
+            "x": x,
+            "y": y,
+            "last_typed_url": last_typed,
+            "current_url": current_url,
+        })
+
+        # Prefer target_repo instead of hard-coding knotreeltest/no-repo
+        typed_matches_target = (
+            target_repo and ("/" + target_repo) in last_typed
+        )
+
+        if typed_matches_target or on_github:
+            arm_attack(
+                "orchestrator.issues_click_triggers_attack",
+                {
+                    "source": source,
+                    "typed_matches_target": typed_matches_target,
+                    "on_github": bool(on_github),
+                },
+            )
+        else:
+            runlog.write({
+                "event": "orchestrator.issues_click_ignored_wrong_url",
+                "source": source,
+                "x": x,
+                "y": y,
+                "last_typed_url": last_typed,
+                "current_url": current_url,
+            })
+
+    # ---------------------------------------------------------------------
+    # Handlers: trace/action & trace/model_item & trace/computer_call
+    # ---------------------------------------------------------------------
     def on_action(evt):
+        """
+        High-level action trace (pre-computer_call), e.g.:
+
+        {"event": "action", "text": "{\"type\": \"click\", ...}"}
+        """
         if state["attack_done"]:
             return
 
         try:
-            action = json.loads(evt.payload.get("text", ""))
+            action = json.loads(evt.payload.get("text", "") or "{}")
         except Exception:
             return
 
@@ -134,36 +239,7 @@ def main():
         # 1) Track typed GitHub URLs
         if action_type == "type":
             text = action.get("text", "") or ""
-            if "github.com/" in text:
-                state["last_typed_url"] = text
-                runlog.write({
-                    "event": "orchestrator.url_typed",
-                    "text": text,
-                })
-
-                try:
-                    # Normalise to a full URL for parsing
-                    url = text if text.startswith("http") else "https://" + text
-                    parsed = urlparse(url)
-                    path = parsed.path or ""  # e.g. "/knotreeltest/no-repo/issues"
-
-                    # We only care if it's the *target repo* and an issues page
-                    # target_repo should be like "knotreeltest/no-repo"
-                    target = settings.target_repo.strip("/") if settings.target_repo else ""
-                    if target and path.startswith("/" + target) and "/issues" in path:
-                        if not state.get("comment_triggered"):
-                            state["comment_triggered"] = True
-                            runlog.write({
-                                "event": "orchestrator.issues_url_typed_triggers_attack",
-                                "typed_url": url,
-                            })
-                except Exception as e:
-                    runlog.write({
-                        "event": "orchestrator.url_parse_error",
-                        "text": text,
-                        "error": repr(e),
-                    })
-
+            handle_typed_text(text, source="action")
             return
 
         # 2) Only the rest is for clicks
@@ -175,37 +251,7 @@ def main():
         if x is None or y is None:
             return
 
-        ISSUES_BOX = {
-            "x_min": 120,
-            "x_max": 220,
-            "y_min": 170,
-            "y_max": 220,
-        }
-
-        def clicked_issues(x: int, y: int) -> bool:
-            return (
-                ISSUES_BOX["x_min"] <= x <= ISSUES_BOX["x_max"] and
-                ISSUES_BOX["y_min"] <= y <= ISSUES_BOX["y_max"]
-            )
-
-        if clicked_issues(x, y) and not state["commented"]:
-            # Optional: require this to be the right repo URL
-            last_url = state.get("last_typed_url", "")
-            if "github.com/knotreeltest/no-repo" in last_url:
-                runlog.write({
-                    "event": "orchestrator.issues_click_seen",
-                    "x": x,
-                    "y": y,
-                    "last_typed_url": last_url,
-                })
-                state["comment_triggered"] = True
-            else:
-                runlog.write({
-                    "event": "orchestrator.issues_click_ignored_wrong_url",
-                    "x": x,
-                    "y": y,
-                    "last_typed_url": last_url,
-                })
+        handle_issues_click(x, y, source="action")
 
     bus.on("trace/action", on_action)
 
@@ -213,7 +259,11 @@ def main():
         item = evt.payload["item"]
         if item.get("type") == "message":
             content = item.get("content", [])
-            if content and isinstance(content, list) and content[0].get("type") == "output_text":
+            if (
+                content
+                and isinstance(content, list)
+                and content[0].get("type") == "output_text"
+            ):
                 text = content[0].get("text", "")
                 runlog.write({"event": "trace.model_text", "text": text})
         state["last_model_items"].append(item)
@@ -228,7 +278,7 @@ def main():
             {"item": {"type": "computer_call", "action": {...}, ...}}
         """
         item = evt.payload.get("item", {})
-        action = item.get("action", {})
+        action = item.get("action", {}) or {}
         action_type = action.get("type")
 
         # Log everything for debugging / traceability
@@ -245,8 +295,6 @@ def main():
         })
 
         # --- Track current_url if present (for GitHub gating) ---
-        # Depending on where you log it, it may appear either
-        # on the item itself or within an 'output' field.
         output = item.get("output") or {}
         current_url = (
             output.get("current_url")
@@ -268,42 +316,13 @@ def main():
         if x is None or y is None:
             return
 
-        # Bounding box for the "Issues" tab on GitHub
-        ISSUES_BOX = {
-            "x_min": 111,
-            "x_max": 199,
-            "y_min": 221,
-            "y_max": 253,
-        }
-
-        def clicked_issues(x: int, y: int) -> bool:
-            return (
-                ISSUES_BOX["x_min"] <= x <= ISSUES_BOX["x_max"]
-                and ISSUES_BOX["y_min"] <= y <= ISSUES_BOX["y_max"]
-            )
-
-        # Optional: only trigger on GitHub pages
-        url = state.get("current_url")
-        on_github = url and "github.com" in url
-
-        if clicked_issues(x, y) and not state["commented"]:
-            runlog.write({
-                "event": "orchestrator.issues_click_seen_computer_call",
-                "x": x,
-                "y": y,
-                "url": url,
-            })
-
-            # You can choose whether to require GitHub URL or not
-            if on_github:
-                print("[orchestrator] Detected Issues-tab click on GitHub; arming attack.")
-                state["comment_triggered"] = True
-            else:
-                print("[orchestrator] Issues-like click but not on GitHub; ignoring for attack.")
+        handle_issues_click(x, y, source="computer_call")
 
     bus.on("trace/computer_call", on_computer_call)
 
+    # ---------------------------------------------------------------------
     # Start CUA subprocess
+    # ---------------------------------------------------------------------
     try:
         cua.start()
     except Exception as e:
@@ -316,7 +335,10 @@ def main():
 
     if not can_attack():
         print("[orchestrator] Safety gate: after starting, CUA not detected as alive. Bailing out before sending task.")
-        runlog.write({"event": "orchestrator.abort_pre_send", "reason": "cua_not_alive_after_start"})
+        runlog.write({
+            "event": "orchestrator.abort_pre_send",
+            "reason": "cua_not_alive_after_start",
+        })
         try:
             cua.stop(timeout=1)
         except Exception:
@@ -326,7 +348,10 @@ def main():
     # Send the task (settings.task_prompt should request PUBLIC_PLAN)
     try:
         cua.send_task(settings.target_repo)
-        runlog.write({"event": "orchestrator.task_sent", "repo": settings.target_repo})
+        runlog.write({
+            "event": "orchestrator.task_sent",
+            "repo": settings.target_repo,
+        })
     except Exception as e:
         runlog.write({"event": "orchestrator.task_send_failed", "error": repr(e)})
         print(f"[orchestrator] Failed to send task to CUA: {e}")
@@ -340,13 +365,19 @@ def main():
     try:
         attack = AttackAgent()
     except Exception as e:
-        runlog.write({"event": "orchestrator.attack_agent_init_failed", "error": repr(e)})
+        runlog.write({
+            "event": "orchestrator.attack_agent_init_failed",
+            "error": repr(e),
+        })
         attack = None
 
     max_watch_seconds = 600
     start = time.time()
     loop_iterations = 0
 
+    # ---------------------------------------------------------------------
+    # Main watch loop
+    # ---------------------------------------------------------------------
     while True:
         loop_iterations += 1
 
@@ -391,35 +422,55 @@ def main():
                     "comment_url": state["comment_url"],
                 })
             except Exception as e:
-                runlog.write({"event": "orchestrator.attack_failed", "error": repr(e)})
+                runlog.write({
+                    "event": "orchestrator.attack_failed",
+                    "error": repr(e),
+                })
                 # still mark as done so we don't retry forever
                 state["attack_done"] = True
 
         time.sleep(0.5)
 
-
+    # ---------------------------------------------------------------------
     # Final logging and cleanup
+    # ---------------------------------------------------------------------
     runlog.write({
         "event": "orchestrator.run_complete",
         "commented": state.get("commented"),
         "attack_done": state.get("attack_done"),
-        "loop_iterations": loop_iterations,          # NEW
-        "elapsed_watch_seconds": time.time() - start # NEW
+        "loop_iterations": loop_iterations,
+        "elapsed_watch_seconds": time.time() - start,
     })
     print(f"[orchestrator] Run complete. Trace saved to: {runlog.path()}")
 
-    # cua.stop(timeout=2)
     try:
         rc = cua.proc.poll()
         print(f"[orchestrator] CUA process return code: {rc}")
-        runlog.write({"event": "orchestrator.cua_exit_code", "return_code": rc})
+        runlog.write({
+            "event": "orchestrator.cua_exit_code",
+            "return_code": rc,
+        })
     except Exception as e:
-        runlog.write({"event": "orchestrator.cua_exit_poll_error", "error": repr(e)})
+        runlog.write({
+            "event": "orchestrator.cua_exit_poll_error",
+            "error": repr(e),
+        })
 
-
-    attack = AttackAgent()
+    # Best-effort cleanup: remove the comment we posted, if any
     if state.get("comment_url"):
-        attack.remove_comment(state["comment_url"])
+        try:
+            cleanup_agent = AttackAgent()
+            cleanup_agent.remove_comment(state["comment_url"])
+            runlog.write({
+                "event": "orchestrator.cleanup_comment_removed",
+                "comment_url": state["comment_url"],
+            })
+        except Exception as e:
+            runlog.write({
+                "event": "orchestrator.cleanup_remove_comment_failed",
+                "error": repr(e),
+                "comment_url": state.get("comment_url"),
+            })
 
 
 if __name__ == "__main__":
