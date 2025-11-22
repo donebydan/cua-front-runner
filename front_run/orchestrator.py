@@ -113,8 +113,18 @@ def main():
     # Basic stdout logging
     # ---------------------------------------------------------------------
     def on_stdout(evt):
-        line = evt.payload.get("line")
-        runlog.write({"event": "cua_stdout", "line": line})
+        line = evt.payload.get("line", "")
+
+        max_len = 400
+        if len(line) > max_len:
+            truncated = line[:max_len] + f"... [truncated {len(line) - max_len} chars]"
+        else:
+            truncated = line
+
+        runlog.write({
+            "event": "cua_stdout",
+            "line": truncated,
+        })
 
     bus.on("process/stdout", on_stdout)
 
@@ -383,13 +393,8 @@ def main():
         # 1) Extract raw text via Tesseract
         text = _tesseract_text_from_image_url(image_url)
 
-        # Log a short snippet for debugging
-        if text:
-            runlog.write({
-                "event": "orchestrator.ocr_text_snippet",
-                "snippet": text[:300],
-            })
-        else:
+        # Empty text check for logging
+        if not text:
             runlog.write({
                 "event": "orchestrator.ocr_empty_text",
             })

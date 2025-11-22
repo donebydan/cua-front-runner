@@ -109,7 +109,7 @@ class Agent:
                 call_output["output"]["current_url"] = current_url
             
             try:
-                print("TRACE_MODEL_ITEM " + json.dumps(sanitize_message(call_output)))
+                print("TRACE_MODEL_ITEM " + json.dumps(call_output))
             except Exception:
                 # don't break the agent if serialization fails
                 pass

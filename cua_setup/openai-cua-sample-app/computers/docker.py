@@ -89,11 +89,6 @@ class DockerComputer:
         Takes a screenshot with ImageMagick (import), returning base64-encoded PNG.
         Requires 'import'.
         """
-        # cmd = (
-        #     f"export DISPLAY={self.display} && "
-        #     "import -window root /tmp/screenshot.png && "
-        #     "base64 /tmp/screenshot.png"
-        # )
         cmd = (
             f"export DISPLAY={self.display} && "
             "import -window root png:- | base64 -w 0"
