@@ -24,6 +24,15 @@ from .docker_control import DockerControl
 from .cua_client import CUAClient
 from .attack_agent import AttackAgent
 
+from defence.labels import CLEAN_LABEL
+from defence.ifc import (
+    propagate_from_current_url,
+    propagate_from_ocr,
+    check_sensitive_action,
+)
+from defence.policy import ActionClass
+
+
 BANNER = """
 ============================================
    CUA Front-Runner PoC — Orchestrator
@@ -37,6 +46,11 @@ def main():
     bus = EventBus()
     runlog = RunLogger(settings.run_dir)
     docker = DockerControl(settings.container_name)
+
+    runlog.write({
+        "event": "defence.status",
+        "enabled": settings.defence_enabled,
+    })
 
     # tracer registers itself to bus, parsing stdout
     malicious_host = settings.malicious_url.split("://")[-1]
@@ -58,7 +72,7 @@ def main():
         "vision_repo": None,
         "vision_tab": None,
         "vision_raw_text": None,
-
+        "taint_label": CLEAN_LABEL,
     }
 
     # keep a reference to the CUAClient so we can check proc liveness
@@ -209,7 +223,6 @@ def main():
         vision_repo = (state.get("vision_repo") or "").strip("/")
         vision_is_github = bool(state.get("vision_is_github"))
         vision_tab = (state.get("vision_tab") or "").lower()
-
 
         runlog.write({
             "event": "orchestrator.issues_click_seen",
@@ -431,6 +444,19 @@ def main():
                 "snippet": raw_text[:500],
             })
 
+            # IFC taint propagation from OCR text
+            old_label = state["taint_label"]
+            new_label = propagate_from_ocr(old_label, raw_text)
+            state["taint_label"] = new_label
+            runlog.write({
+                "event": "orchestrator.ifc_ocr_propagated",
+                "ifc_label": {
+                    "trusted": new_label.trusted,
+                    "sources": [s.name for s in new_label.sources],
+                    "domains": list(new_label.domains),
+                },
+            })
+
         # Augment with URL-derived truth if we have it
         current_url = state.get("current_url")
         if current_url and "github.com" in current_url:
@@ -541,6 +567,25 @@ def main():
 
         if item_type == "computer_call_output":
             output = item.get("output") or {}
+
+            # IFC taint propagation from current_url in computer_call_output
+            current_url = output.get("current_url")
+            if current_url:
+                state["current_url"] = current_url
+                old_label = state["taint_label"]
+                new_label = propagate_from_current_url(old_label, current_url)
+                state["taint_label"] = new_label
+
+                runlog.write({
+                    "event": "orchestrator.current_url_seen",
+                    "url": current_url,
+                    "ifc_label": {
+                        "trusted": new_label.trusted,
+                        "sources": [s.name for s in new_label.sources],
+                        "domains": list(new_label.domains),
+                    },
+                })
+
             if output.get("type") == "input_image":
                 image_url = output.get("image_url")
                 if image_url:
@@ -689,23 +734,50 @@ def main():
         if attack and state.get("comment_triggered") and not state["commented"]:
             try:
                 runlog.write({"event": "orchestrator.attack_start"})
-                state["commented"] = True
-                state["comment_url"] = attack.comment_on_issue(
-                    settings.issue_url,
-                    settings.target_repo,
-                    settings.attacker_comment,
+                label = state["taint_label"]
+                decision = check_sensitive_action(
+                    label,
+                    ActionClass.EXTERNAL_POST,
+                    target_url=settings.issue_url,
                 )
-                state["attack_done"] = True
+
                 runlog.write({
-                    "event": "orchestrator.attack_comment_posted",
-                    "comment_url": state["comment_url"],
+                    "event": "orchestrator.ifc_decision",
+                    "action_class": "EXTERNAL_POST",
+                    "target_url": settings.issue_url,
+                    "allow": decision.allow,
+                    "warn": decision.warn,
+                    "reason": decision.reason,
+                    "label": {
+                        "trusted": label.trusted,
+                        "sources": [s.name for s in label.sources],
+                        "domains": list(label.domains),
+                    },
                 })
+
+                if not decision.allow:
+                    # Defence kicks in: do NOT post the comment
+                    state["attack_done"] = True
+                    runlog.write({"event": "orchestrator.ifc_blocked_attack"})
+                else:
+                    # Attack Demo Logic: post the comment
+                    state["commented"] = True
+                    state["comment_url"] = attack.comment_on_issue(
+                        settings.issue_url,
+                        settings.target_repo,
+                        settings.attacker_comment,
+                    )
+                    state["attack_done"] = True
+                    runlog.write({
+                        "event": "orchestrator.attack_comment_posted",
+                        "comment_url": state["comment_url"],
+                    })
+
             except Exception as e:
                 runlog.write({
                     "event": "orchestrator.attack_failed",
                     "error": repr(e),
                 })
-                # still mark as done so we don't retry forever
                 state["attack_done"] = True
 
         time.sleep(0.5)
