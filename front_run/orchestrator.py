@@ -1,4 +1,3 @@
-# poc/orchestrator.py
 """
 Orchestrator for the CUA Front-Runner PoC.
 """
@@ -30,12 +29,12 @@ from defence.ifc import (
     propagate_from_ocr,
     check_sensitive_action,
 )
-from defence.policy import ActionClass
+from defence.policy import ActionClass, classify_action
 
 
 BANNER = """
 ============================================
-   CUA Front-Runner PoC — Orchestrator
+   CUA Front-Runner PoC ? Orchestrator
 ============================================
 """
 
@@ -122,6 +121,61 @@ def main():
         # all checks passed
         runlog.write({"event": "safety.can_attack", "ok": True})
         return True
+
+    # ---------------------------------------------------------------------
+    # IFC Gating helper
+    # ---------------------------------------------------------------------
+    def ifc_gate_action(action: dict, phase: str) -> bool:
+        """
+        Run IFC decision for a single action.
+
+        Returns:
+            True  => allow action to proceed
+            False => block / abort run (caller should enforce)
+        """
+        action_class = classify_action(action, state)
+        label = state["taint_label"]
+
+        # For navigation we can optionally pass the current URL as target
+        target_url = None
+        if action_class in (ActionClass.NAVIGATION, ActionClass.READ_ONLY):
+            target_url = state.get("current_url")
+
+        decision = check_sensitive_action(label, action_class, target_url=target_url)
+
+        runlog.write({
+            "event": "orchestrator.ifc_action_decision",
+            "phase": phase,
+            "action_class": action_class.name,
+            "allow": decision.allow,
+            "warn": decision.warn,
+            "reason": decision.reason,
+            "label": {
+                "trusted": label.trusted,
+                "sources": [s.name for s in label.sources],
+                "domains": list(label.domains),
+            },
+            "action": action,
+        })
+
+        if not decision.allow:
+            # Enforcement strategy for demo: stop CUA + mark run as ?blocked?
+            state["attack_done"] = True
+            try:
+                cua.stop(timeout=1)
+            except Exception:
+                pass
+
+            runlog.write({
+                "event": "orchestrator.ifc_blocked_action",
+                "phase": phase,
+                "action_class": action_class.name,
+            })
+
+            return False
+
+        return True
+
 
     # ---------------------------------------------------------------------
     # Basic stdout logging
@@ -250,7 +304,7 @@ def main():
         # Conditions under which we arm the attack:
         #   - Typed URL clearly for target repo's issues page, OR
         #   - OCR says it's the target repo and the issues tab is involved, OR
-        #   - We’re on a GitHub page (by URL or OCR) and this appears to be Issues tab.
+        #   - We?re on a GitHub page (by URL or OCR) and this appears to be Issues tab.
         if (
             typed_matches_target
             or vision_matches_target
@@ -532,6 +586,10 @@ def main():
         if not action_type:
             return
 
+        if not ifc_gate_action(action, phase="trace/action"):
+            # block; don?t run any of the normal logic for this action
+            return
+
         # 1) Track typed GitHub URLs
         if action_type == "type":
             text = action.get("text", "") or ""
@@ -631,6 +689,9 @@ def main():
                 "current_url": state.get("current_url"),
             },
         })
+
+        if not ifc_gate_action(action, phase="trace/computer_call"):
+            return
 
         if action_type != "click":
             return

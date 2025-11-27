@@ -81,16 +81,38 @@ def taint_from_url(label: Label, url: str, src: TaintSource) -> Label:
 
 def taint_from_ocr_text(label: Label, text: str) -> Label:
     """
-    Example OCR-based heuristic: if we see non-whitelisted domains in text,
-    treat them as taint sources - but keep Github etc. as trusted.
+    OCR-based heuristic:
+      1) Taint from full URLs (https://...).
+      2) ALSO tain from bare hostnames like "github.io", "knotreeltest.github.io".
     """
-    # TODO we can plug a better URL extractor here..
-    url_re = re.compile(r"https?://[^\s\"'>]+", re.IGNORECASE)
-    urls = url_re.findall(text or "")
+    if not text:
+        return label
 
     new_label = label
-    for u in urls:
+
+    # 1) Full URLs first
+    url_re = re.compile(r"https?://[^\s\"'>]+", re.IGNORECASE)
+    for u in url_re.findall(text):
         new_label = taint_from_url(new_label, u, TaintSource.OCR)
+
+    # 2) Bare hostnames (no scheme) – e.g. "github.io", "knotreeltest.github.io"
+    host_re = re.compile(
+        r"\b([a-z0-9.-]+\.(?:io|com|net|org))\b",
+        re.IGNORECASE,
+    )
+    for host in host_re.findall(text):
+        host_l = host.lower()
+
+        # We already handle github.com specially via TRUSTED_CODE_HOSTS.
+        # For bare hosts, we synthesize a fake https:// URL to reuse taint_from_url.
+        if host_l == "github.com":
+            # Treat as trusted code host; this will record but not taint.
+            fake_url = f"https://{host_l}"
+            new_label = taint_from_url(new_label, fake_url, TaintSource.OCR)
+        else:
+            # Any other host (e.g. github.io, knotreeltest.github.io, etc.)
+            fake_url = f"https://{host_l}"
+            new_label = taint_from_url(new_label, fake_url, TaintSource.OCR)
 
     return new_label
 
@@ -121,6 +143,7 @@ def decide_action(label: Label, action: ActionClass, target_url: Optional[str] =
       - Allow most READ_ONLY and NAVIGATION actions.
       - Restrict EXTERNAL_POST / CODE_WRITE when tainted by untrusted domains.
     """
+    print(f"Deciding action {action}")
     # Clean context -> everything allowed
     if label.is_clean():
         return ActionDecision(True, False, "label_clean")
@@ -143,11 +166,66 @@ def decide_action(label: Label, action: ActionClass, target_url: Optional[str] =
         return ActionDecision(True, True, "tainted_but_readonly_ok")
 
     if action in (ActionClass.CODE_WRITE, ActionClass.EXTERNAL_POST, ActionClass.SYSTEM_MUTATION):
-        # Only allow if target is clearly trusted AND we’re not tainted by explicit bad hosts
-        if target_trusted and not (label.domains & EXPLICIT_UNTRUSTED_HOSTS):
-            return ActionDecision(True, True, f"tainted_but_target_trusted:{target_reason}")
+        # Only allow if:
+        #   - target is trusted, AND
+        #   - EVERY taint domain is itself a trusted code host.
+        if target_trusted and all(h in TRUSTED_CODE_HOSTS for h in label.domains):
+            return ActionDecision(True, True, f"tainted_but_only_trusted_code_hosts:{target_reason}")
+
         # Otherwise block
         return ActionDecision(False, True, "tainted_block_sensitive_action")
 
     # Fallback: block conservatively
     return ActionDecision(False, True, "unhandled_action_class")
+
+
+def classify_action(action: dict, state: dict) -> ActionClass:
+    """
+    Map raw CUA actions into IFC sink categories.
+    Tune this mapping as your demo evolves.
+    """
+    action_type = (action.get("type") or "").lower()
+
+    # --- Mouse stuff: mostly navigation ---
+    if action_type in ("click", "move", "scroll", "drag", "screenshot", "wait"):
+        return ActionClass.READ_ONLY if action_type in ("screenshot", "wait") else ActionClass.NAVIGATION
+
+    # --- Keyboard shortcuts ---
+    if action_type == "keypress":
+        keys = {k.upper() for k in action.get("keys", [])}
+
+
+        # Example: CTRL+ALT+T opens terminal -> high risk
+        if keys == {"CTRL", "ALT", "T"}:
+            return ActionClass.SYSTEM_MUTATION
+
+        if keys == {"CTRL", "SHIFT", "V"}:
+            # Pasting is a write sink (especially in terminal/editor)
+            return ActionClass.CODE_WRITE
+
+        # Other shortcuts – treat as navigation by default
+        return ActionClass.NAVIGATION
+
+    # --- Text typing ---
+    if action_type == "type":
+        text = (action.get("text") or "").strip()
+
+        # 1) If it *looks* like a URL, treat it as navigation.
+        #    This allows typing `github.com/knotreeltest/no-repo` even when tainted.
+        if re.match(r"^(https?://)?[a-z0-9.-]+\.[a-z]{2,}(/.*)?$", text, re.IGNORECASE):
+            return ActionClass.NAVIGATION
+
+        # 2) If OCR suggests we’re in a browser, treat generic typing as navigation too.
+        raw = (state.get("vision_raw_text") or "").lower()
+        if any(browser in raw for browser in ("firefox", "chrome", "safari", "edge", "address and search bar")):
+            return ActionClass.NAVIGATION
+
+        # 3) If OCR suggests terminal / shell / editor, be strict.
+        if any(term in raw for term in ("terminal", "bash", "zsh", "powershell", "cmd.exe", "visual studio code", "vscode")):
+            return ActionClass.CODE_WRITE
+
+        # 4) Fallback: treat as CODE_WRITE (conservative)
+        return ActionClass.CODE_WRITE
+
+    # Fallback: read-only
+    return ActionClass.READ_ONLY
