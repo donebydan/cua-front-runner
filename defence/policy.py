@@ -81,9 +81,12 @@ def taint_from_url(label: Label, url: str, src: TaintSource) -> Label:
 
 def taint_from_ocr_text(label: Label, text: str) -> Label:
     """
-    OCR-based heuristic:
-      1) Taint from full URLs (https://...).
-      2) ALSO tain from bare hostnames like "github.io", "knotreeltest.github.io".
+    OCR-based heuristic.
+      - We only *taint* from OCR when the host is in EXPLICIT_UNTRUSTED_HOSTS.
+      - Normal sites that appear in suggestion lists (Wikipedia, YouTube, etc.)
+        do NOT taint; they’re only recorded as notes/domains.
+        - Important for new tabs where the URL bar shows wikipedia.org, youtube.com, etc.
+      - Generic "unknown_web_host" tainting is done via current_url, not OCR.
     """
     if not text:
         return label
@@ -93,7 +96,18 @@ def taint_from_ocr_text(label: Label, text: str) -> Label:
     # 1) Full URLs first
     url_re = re.compile(r"https?://[^\s\"'>]+", re.IGNORECASE)
     for u in url_re.findall(text):
-        new_label = taint_from_url(new_label, u, TaintSource.OCR)
+        # Decide how to treat this URL based on classify_url
+        is_trusted, reason = classify_url(u)
+
+        if reason == "explicit_untrusted_host":
+            # This is one of our known-bad domains (e.g. knotreeltest.github.io)
+            new_label = taint_from_url(new_label, u, TaintSource.OCR)
+        else:
+            # Seen in OCR, but not explicitly untrusted: record, don't taint
+            host = _hostname(u)
+            if host:
+                new_label.add_domain(host)
+                new_label.add_note(f"ocr_seen_host:{host} reason:{reason}")
 
     # 2) Bare hostnames (no scheme) – e.g. "github.io", "knotreeltest.github.io"
     host_re = re.compile(
@@ -102,17 +116,19 @@ def taint_from_ocr_text(label: Label, text: str) -> Label:
     )
     for host in host_re.findall(text):
         host_l = host.lower()
+        fake_url = f"https://{host_l}"
 
-        # We already handle github.com specially via TRUSTED_CODE_HOSTS.
-        # For bare hosts, we synthesize a fake https:// URL to reuse taint_from_url.
-        if host_l == "github.com":
-            # Treat as trusted code host; this will record but not taint.
-            fake_url = f"https://{host_l}"
+        is_trusted, reason = classify_url(fake_url)
+
+        if reason == "explicit_untrusted_host":
+            # Only explicit untrusted hosts taint via OCR
             new_label = taint_from_url(new_label, fake_url, TaintSource.OCR)
         else:
-            # Any other host (e.g. github.io, knotreeltest.github.io, etc.)
-            fake_url = f"https://{host_l}"
-            new_label = taint_from_url(new_label, fake_url, TaintSource.OCR)
+            # github.com is already "trusted_code_host" in classify_url;
+            # wikipedia.org / youtube.com / etc will be "unknown_web_host".
+            # We record them but don't flip trusted=False from OCR alone.
+            new_label.add_domain(host_l)
+            new_label.add_note(f"ocr_seen_host:{host_l} reason:{reason}")
 
     return new_label
 
@@ -135,47 +151,66 @@ class ActionDecision:
     reason: str
 
 
-def decide_action(label: Label, action: ActionClass, target_url: Optional[str] = None) -> ActionDecision:
+def decide_action(
+    label: Label,
+    action: ActionClass,
+    target_url: Optional[str] = None,
+) -> ActionDecision:
     """
-    “IFC taint-block” logic lives here.
-
-    We do *not* kill the whole process on taint; instead, we:
-      - Allow most READ_ONLY and NAVIGATION actions.
-      - Restrict EXTERNAL_POST / CODE_WRITE when tainted by untrusted domains.
+    “IFC taint-block” logic:
+      - If label is still trusted, and we haven't seen explicit bad hosts,
+        we allow all actions (may warn if domains are non-empty).
+      - Once we have taint (label.trusted == False OR explicit bad hosts),
+        we start restricting sensitive sinks, with behaviour depending on
+        the *target* of the action (target_url).
     """
-    print(f"Deciding action {action}")
-    # Clean context -> everything allowed
-    if label.is_clean():
-        return ActionDecision(True, False, "label_clean")
 
-    # Optionally refine based on target URL
+    # --- Decode the sink (where is this action going?) ---
     target_host = _hostname(target_url) if target_url else None
-    target_trusted, target_reason = (True, "no_target_url")
     if target_url:
         target_trusted, target_reason = classify_url(target_url)
+    else:
+        target_trusted, target_reason = (True, "no_target_url")
 
-    # If we’re tainted but only by trusted code hosts, be permissive
-    if label.trusted is False and label.domains and all(
-        h in TRUSTED_CODE_HOSTS for h in label.domains
-    ):
-        return ActionDecision(True, True, "tainted_by_trusted_code_hosts_only")
+    # --- 1) Trusted label, no explicit-bad domains -> safe for sinks ---
+    if label.trusted and not (label.domains & EXPLICIT_UNTRUSTED_HOSTS):
+        if label.domains:
+            # benign taint (wikipedia, youtube, github.com only, etc.)
+            return ActionDecision(True, True, "trusted_label_with_benign_domains")
+        else:
+            # completely clean
+            return ActionDecision(True, False, "label_clean")
 
-    # interesting cases: tainted by unknown / explicit untrusted hosts
+    # --- 2) From here we know:
+    #        - label.trusted == False  OR
+    #        - label.domains contains an explicit untrusted host.
+    tainted_by_explicit = bool(label.domains & EXPLICIT_UNTRUSTED_HOSTS)
+
     if action in (ActionClass.READ_ONLY, ActionClass.NAVIGATION):
         # Let the agent keep browsing / reading, but mark as risky
         return ActionDecision(True, True, "tainted_but_readonly_ok")
 
     if action in (ActionClass.CODE_WRITE, ActionClass.EXTERNAL_POST, ActionClass.SYSTEM_MUTATION):
-        # Only allow if:
-        #   - target is trusted, AND
-        #   - EVERY taint domain is itself a trusted code host.
-        if target_trusted and all(h in TRUSTED_CODE_HOSTS for h in label.domains):
-            return ActionDecision(True, True, f"tainted_but_only_trusted_code_hosts:{target_reason}")
+        # 2A) Classic cross-origin exfil:
+        #     tainted by explicit bad host, but trying to write/post to a trusted host
+        #     (e.g. tainted by knotreeltest.github.io, posting to github.com).
+        if tainted_by_explicit and target_trusted:
+            return ActionDecision(False, True, "cross_origin_exfil_block")
 
-        # Otherwise block
-        return ActionDecision(False, True, "tainted_block_sensitive_action")
+        # 2B) Tainted by explicit host and target is that same host.
+        #     For now, we *allow but warn* (could be changed to block).
+        if tainted_by_explicit and target_host in (label.domains & EXPLICIT_UNTRUSTED_HOSTS):
+            return ActionDecision(True, True, "tainted_post_to_same_untrusted_host")
 
-    # Fallback: block conservatively
+        # 2C) Generic taint (label.trusted == False) but no explicit bad host:
+        #     keep your original conservative behaviour.
+        if not label.trusted:
+            return ActionDecision(False, True, "tainted_block_sensitive_action_no_explicit_host")
+
+        # Fallback: allow but warn about unknown sink classification
+        return ActionDecision(True, True, f"tainted_sink_but_no_explicit_host:{target_reason}")
+
+    # --- 3) Fallback for any unhandled action class ---
     return ActionDecision(False, True, "unhandled_action_class")
 
 
