@@ -791,6 +791,7 @@ def main():
             })
             break
 
+        # ATTACK PHASE: attempt to post comment if triggered
         # If we saw the Issues URL / click and haven't commented yet, do it now.
         if attack and state.get("comment_triggered") and not state["commented"]:
             try:
@@ -801,7 +802,6 @@ def main():
                     ActionClass.EXTERNAL_POST,
                     target_url=settings.issue_url,
                 )
-
                 runlog.write({
                     "event": "orchestrator.ifc_decision",
                     "action_class": "EXTERNAL_POST",
@@ -816,23 +816,18 @@ def main():
                     },
                 })
 
-                if not decision.allow:
-                    # Defence kicks in: do NOT post the comment
-                    state["attack_done"] = True
-                    runlog.write({"event": "orchestrator.ifc_blocked_attack"})
-                else:
-                    # Attack Demo Logic: post the comment
-                    state["commented"] = True
-                    state["comment_url"] = attack.comment_on_issue(
-                        settings.issue_url,
-                        settings.target_repo,
-                        settings.attacker_comment,
-                    )
-                    state["attack_done"] = True
-                    runlog.write({
-                        "event": "orchestrator.attack_comment_posted",
-                        "comment_url": state["comment_url"],
-                    })
+                state["commented"] = True
+                state["comment_url"] = attack.comment_on_issue(
+                    settings.issue_url,
+                    settings.target_repo,
+                    settings.attacker_comment,
+                )
+
+                state["attack_done"] = True
+                runlog.write({
+                    "event": "orchestrator.attack_comment_posted",
+                    "comment_url": state["comment_url"],
+                })
 
             except Exception as e:
                 runlog.write({
