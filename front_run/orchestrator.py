@@ -1,4 +1,3 @@
-# poc/orchestrator.py
 """
 Orchestrator for the CUA Front-Runner PoC.
 """
@@ -24,9 +23,18 @@ from .docker_control import DockerControl
 from .cua_client import CUAClient
 from .attack_agent import AttackAgent
 
+from defence.labels import CLEAN_LABEL
+from defence.ifc import (
+    propagate_from_current_url,
+    propagate_from_ocr,
+    check_sensitive_action,
+)
+from defence.policy import ActionClass, classify_action
+
+
 BANNER = """
 ============================================
-   CUA Front-Runner PoC — Orchestrator
+   CUA Front-Runner PoC ? Orchestrator
 ============================================
 """
 
@@ -37,6 +45,11 @@ def main():
     bus = EventBus()
     runlog = RunLogger(settings.run_dir)
     docker = DockerControl(settings.container_name)
+
+    runlog.write({
+        "event": "defence.status",
+        "enabled": settings.defence_enabled,
+    })
 
     # tracer registers itself to bus, parsing stdout
     malicious_host = settings.malicious_url.split("://")[-1]
@@ -58,7 +71,7 @@ def main():
         "vision_repo": None,
         "vision_tab": None,
         "vision_raw_text": None,
-
+        "taint_label": CLEAN_LABEL,
     }
 
     # keep a reference to the CUAClient so we can check proc liveness
@@ -108,6 +121,61 @@ def main():
         # all checks passed
         runlog.write({"event": "safety.can_attack", "ok": True})
         return True
+
+    # ---------------------------------------------------------------------
+    # IFC Gating helper
+    # ---------------------------------------------------------------------
+    def ifc_gate_action(action: dict, phase: str) -> bool:
+        """
+        Run IFC decision for a single action.
+
+        Returns:
+            True  => allow action to proceed
+            False => block / abort run (caller should enforce)
+        """
+        action_class = classify_action(action, state)
+        label = state["taint_label"]
+
+        # For navigation we can optionally pass the current URL as target
+        target_url = None
+        if action_class in (ActionClass.NAVIGATION, ActionClass.READ_ONLY):
+            target_url = state.get("current_url")
+
+        decision = check_sensitive_action(label, action_class, target_url=target_url)
+
+        runlog.write({
+            "event": "orchestrator.ifc_action_decision",
+            "phase": phase,
+            "action_class": action_class.name,
+            "allow": decision.allow,
+            "warn": decision.warn,
+            "reason": decision.reason,
+            "label": {
+                "trusted": label.trusted,
+                "sources": [s.name for s in label.sources],
+                "domains": list(label.domains),
+            },
+            "action": action,
+        })
+
+        if not decision.allow:
+            # Enforcement strategy for demo: stop CUA + mark run as ?blocked?
+            state["attack_done"] = True
+            try:
+                cua.stop(timeout=1)
+            except Exception:
+                pass
+
+            runlog.write({
+                "event": "orchestrator.ifc_blocked_action",
+                "phase": phase,
+                "action_class": action_class.name,
+            })
+
+            return False
+
+        return True
+
 
     # ---------------------------------------------------------------------
     # Basic stdout logging
@@ -210,7 +278,6 @@ def main():
         vision_is_github = bool(state.get("vision_is_github"))
         vision_tab = (state.get("vision_tab") or "").lower()
 
-
         runlog.write({
             "event": "orchestrator.issues_click_seen",
             "source": source,
@@ -237,7 +304,7 @@ def main():
         # Conditions under which we arm the attack:
         #   - Typed URL clearly for target repo's issues page, OR
         #   - OCR says it's the target repo and the issues tab is involved, OR
-        #   - We’re on a GitHub page (by URL or OCR) and this appears to be Issues tab.
+        #   - We?re on a GitHub page (by URL or OCR) and this appears to be Issues tab.
         if (
             typed_matches_target
             or vision_matches_target
@@ -431,6 +498,19 @@ def main():
                 "snippet": raw_text[:500],
             })
 
+            # IFC taint propagation from OCR text
+            old_label = state["taint_label"]
+            new_label = propagate_from_ocr(old_label, raw_text)
+            state["taint_label"] = new_label
+            runlog.write({
+                "event": "orchestrator.ifc_ocr_propagated",
+                "ifc_label": {
+                    "trusted": new_label.trusted,
+                    "sources": [s.name for s in new_label.sources],
+                    "domains": list(new_label.domains),
+                },
+            })
+
         # Augment with URL-derived truth if we have it
         current_url = state.get("current_url")
         if current_url and "github.com" in current_url:
@@ -506,6 +586,10 @@ def main():
         if not action_type:
             return
 
+        if not ifc_gate_action(action, phase="trace/action"):
+            # block; don?t run any of the normal logic for this action
+            return
+
         # 1) Track typed GitHub URLs
         if action_type == "type":
             text = action.get("text", "") or ""
@@ -541,6 +625,25 @@ def main():
 
         if item_type == "computer_call_output":
             output = item.get("output") or {}
+
+            # IFC taint propagation from current_url in computer_call_output
+            current_url = output.get("current_url")
+            if current_url:
+                state["current_url"] = current_url
+                old_label = state["taint_label"]
+                new_label = propagate_from_current_url(old_label, current_url)
+                state["taint_label"] = new_label
+
+                runlog.write({
+                    "event": "orchestrator.current_url_seen",
+                    "url": current_url,
+                    "ifc_label": {
+                        "trusted": new_label.trusted,
+                        "sources": [s.name for s in new_label.sources],
+                        "domains": list(new_label.domains),
+                    },
+                })
+
             if output.get("type") == "input_image":
                 image_url = output.get("image_url")
                 if image_url:
@@ -586,6 +689,9 @@ def main():
                 "current_url": state.get("current_url"),
             },
         })
+
+        if not ifc_gate_action(action, phase="trace/computer_call"):
+            return
 
         if action_type != "click":
             return
@@ -685,27 +791,49 @@ def main():
             })
             break
 
+        # ATTACK PHASE: attempt to post comment if triggered
         # If we saw the Issues URL / click and haven't commented yet, do it now.
         if attack and state.get("comment_triggered") and not state["commented"]:
             try:
                 runlog.write({"event": "orchestrator.attack_start"})
+                label = state["taint_label"]
+                decision = check_sensitive_action(
+                    label,
+                    ActionClass.EXTERNAL_POST,
+                    target_url=settings.issue_url,
+                )
+                runlog.write({
+                    "event": "orchestrator.ifc_decision",
+                    "action_class": "EXTERNAL_POST",
+                    "target_url": settings.issue_url,
+                    "allow": decision.allow,
+                    "warn": decision.warn,
+                    "reason": decision.reason,
+                    "label": {
+                        "trusted": label.trusted,
+                        "sources": [s.name for s in label.sources],
+                        "domains": list(label.domains),
+                    },
+                })
+
                 state["commented"] = True
                 state["comment_url"] = attack.comment_on_issue(
                     settings.issue_url,
                     settings.target_repo,
                     settings.attacker_comment,
                 )
+
                 state["attack_done"] = True
                 runlog.write({
                     "event": "orchestrator.attack_comment_posted",
                     "comment_url": state["comment_url"],
                 })
+
             except Exception as e:
                 runlog.write({
                     "event": "orchestrator.attack_failed",
                     "error": repr(e),
                 })
-                # still mark as done so we don't retry forever
                 state["attack_done"] = True
 
         time.sleep(0.5)

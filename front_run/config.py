@@ -45,5 +45,9 @@ class Settings:
     # Logging
     verbose: bool = os.getenv("VERBOSE", "1") == "1"
 
+    # Defence on/off
+    defence_enabled: bool = os.getenv("DEFENCE_ENABLED", "1") == "1"
+
+
 settings = Settings()
 settings.run_dir.mkdir(parents=True, exist_ok=True)
