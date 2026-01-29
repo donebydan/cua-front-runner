@@ -114,14 +114,17 @@ def create_response_azure(**kwargs):
     azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
     api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2025-03-01-preview")
 
-    if not azure_api_key:
-        raise ValueError("AZURE_OPENAI_API_KEY environment variable is required")
-
     # Construct the Azure OpenAI API URL
     url = f"{azure_endpoint}/openai/responses?api-version={api_version}"
 
-    # Azure uses api-key header instead of Bearer token
-    headers = {"api-key": azure_api_key, "Content-Type": "application/json"}
+    print(kwargs["model"])
+
+    if not azure_api_key:
+        #raise ValueError("AZURE_OPENAI_API_KEY environment variable is required")
+        # Use token from AZURE_AD_TOKEN
+        headers = {"Authorization": f"Bearer {os.getenv('AZURE_AD_TOKEN')}", "Content-Type": "application/json"}
+    else:
+        headers = {"api-key": azure_api_key, "Content-Type": "application/json"}
 
     # Send the request
     response = requests.post(url, headers=headers, json=kwargs)

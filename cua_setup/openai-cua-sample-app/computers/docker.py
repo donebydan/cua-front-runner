@@ -148,6 +148,11 @@ class DockerComputer:
             "SPACE": "space",
             "BACKSPACE": "BackSpace",
             "TAB": "Tab",
+            "CTRL": "Ctrl",
+            "ALT": "Alt",
+            "SHIFT": "Shift",
+            "T": "t",
+            "V": "v",
         }
         mapped_keys = [mapping.get(key, key) for key in keys]
         combo = "+".join(mapped_keys)
