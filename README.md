@@ -1,162 +1,29 @@
-# CUA Front-Runner: An Automation & Security Testbed for Computer-Use Agents
+# CUA Front-Runner PoC
 
-This project provides a modular automation framework for testing, attacking, and defending Computer-Use Agents (CUAs) — agents that interact with real user interfaces via screenshots, OCR, reasoning, and tool execution.
+This Proof of Concept (PoC) demonstrates a timing and content-injection Computer Use Agent (CUA):
 
-The framework is designed to:
-
-Plug into real CUA deployments (VMs, Docker containers, browser automation).
-
-Observe agent behaviour through fine-grained execution traces.
-
-Simulate timing- and context-based attacks (e.g. front-running, OCR-driven injection).
-
-Enforce Information Flow Control (IFC) defences that constrain unsafe behaviour without killing agent utility.
-
-This repository currently includes a front-running attack PoC targeting GitHub-based developer workflows, along with an IFC-based defence that detects and blocks unsafe actions once untrusted context is observed.
-
-## Architecture Overview
-
-The system is organised around four core components:
-
-### 1. Orchestrator
-
-The *orchestrator* is the control plane of the system. It:
-
-* Launches and supervises the CUA process.
-* Receives structured events describing agent actions, model outputs, OCR results, and environment state.
-* Maintains global run state (e.g. current URL, taint status, attack triggers).
-* Decides when to invoke attacker logic or enforce defences.
-
-The orchestrator *does not modify the CUA itself* — all observation and control happens externally.
-
-
-### 2. Computer-Use Agent (CUA)
-
-The CUA is the agent under test. It can be:
-
-* A Docker-based VM agent (as in the current demo).
-* A browser-only agent (e.g. Playwright / Selenium).
-* Any agent that emits observable actions (clicks, typing, screenshots).
-
-To integrate a new CUA deployment, you only need to provide a thin adapter that:
-* Starts the agent process.
-* Streams stdout / trace output.
-* Emits structured events for actions and tool calls.
-
-> Example adapters:
-> 
-> * VM-based CUAs → Docker + VNC + screenshot hooks
-> * Browser agents → Playwright action listeners
-> * Desktop automation → OS-level input hooks
-
-
-### 3. Event Bus
-
-All components communicate through a central event bus.
-
-Events include:
-* Model inference steps
-* UI actions (click, type, keypress, wait)
-* Screenshots and OCR text
-* URL changes
-* Attacker and defence decisions
-
-This decoupled design allows:
-* Multiple observers (attackers, defences, loggers) to react independently.
-* Real-time attacks that “watch” the agent’s state without interfering directly.
-* Post-hoc replay and analysis of full agent runs.
-
-
-### 4. Attacker Agents
-
-Attacks are implemented as *first-class agents* that listen to the same events as the defender.
-
-The included PoC demonstrates a *front-running attack*:
-* The attacker waits for the CUA to reach a specific UI state (GitHub Issues tab).
-* It exploits OCR and/or model reasoning signals to infer agent intent.
-* It injects a malicious comment into a GitHub issue just-in-time.
-* The CUA unknowingly consumes and follows the injected guidance.
-
-This attack can be extended to:
-* Other websites and workflows.
-* Multi-step toolchain attacks.
-* Agent-to-agent (A2A) manipulation scenarios.
-
-
-## Execution Tracing and Logging
-
-Every run produces a complete structured trace, written to:
-```bash
-runs/<timestamp>/trace.jsonl
-```
-
-The trace records:
-* All agent actions and tool calls.
-* Model outputs (without accessing private chain-of-thought).
-* OCR text extracted from screenshots.
-* Attacker signals and triggers.
-* Defence decisions and enforcement points.
-
-This makes it possible to:
-* Reconstruct _exactly what the agent saw and did_.
-* Debug subtle timing and perception failures.
-* Compare defended vs undefended runs side-by-side.
-
-
-## Information Flow Control (IFC) Defence
-
-The defence mechanism is based on Information Flow Control, implemented in two layers:
-
-### 1. Propagation Logic (Generic)
-
-The system tracks taint labels that represent whether the agent’s context has been influenced by untrusted sources.
-
-Taint can originate from:
-* OCR text from screenshots
-* URLs visited by the agent
-* External content injected mid-task
-
-Taint *propagates forward* through agent state but does _not_ immediately halt execution.
-
-### 2. Policy Logic (Customisable)
-
-Policies decide what actions are allowed given the current taint state.
-
-Key ideas:
-* The agent may continue browsing and reading while tainted.
-* *Sensitive actions* (e.g. posting externally, opening terminals, executing commands) are blocked once tainted.
-* Trusted domains (e.g. `github.com`) can be whitelisted.
-* Policies are scenario-specific and easy to replace.
-
-This separation allows operators to:
-* Define their own trust boundaries.
-* Tune strictness without rewriting the core logic.
-* Experiment with different security postures.
-
-
-## Included Front-Running Attack Demo
-
-The current PoC demonstrates:
-* A CUA tasked with helping a developer on a GitHub repository.
-* An attacker that front-runs the agent by injecting a malicious issue comment.
-* A malicious site that abuses copy-to-clipboard behaviour.
-* A successful compromise in the *undefended run*.
-* A clean block of unsafe behaviour in the *defended run*, without breaking benign agent actions.
-
-This attack is intentionally simple but highlights a broader class of *contextual and timing-based vulnerabilities* in agentic systems.
-
+1. The CUA is tasked to explore closed issues for a repository we control.
+2. We currently pause the CUA container. Live front-run is a TODO.
+3. A second (attack) agent posts a crafted comment to a closed issue.
+4. We resume the CUA, which now sees the injected guidance and may follow it to a chosen URL.
 
 ## Setup
-### 1. Install Dependencies
+
+Use this PoC alongside your existing CUA Docker setup.
+
+### 1. Install dependencies
+
 ```bash
 conda env create -f env.yml
 ```
 
-### 2. Configure Environment Variables
+### 2. Configure environment variables
 
-Create a .env file:
+Create a `.env` file (or export variables directly) with:
+
 ```bash
-GITHUB_TOKEN=ghp_...              # repo:issues scope
+# Existing Azure/OpenAI creds live in your project's .env; add these alongside.
+GITHUB_TOKEN=ghp_...              # Personal Access Token with repo:issues scope
 TARGET_REPO=your-org/your-test-repo
 MALICIOUS_URL=https://example.com/help
 CUA_CONTAINER_NAME=cua-sample-app
@@ -165,40 +32,63 @@ PAUSE_AFTER_SECONDS=25
 VERBOSE=1
 ```
 
-⚠️ Security reminder: Never commit .env files.
+**Security reminder**: Do not commit `.env` files. Add `.env` to your `.gitignore`:
+
+```gitignore
+# .gitignore
+.env
+*.env
+.env.*
+```
 
 ## Running the Demo
-### 1. Start the CUA Container
+
+### 1. Start the CUA container
+
 ```bash
 docker run --rm -it --name cua-sample-app \
   -p 5900:5900 --dns=1.1.1.3 -e DISPLAY=:99 \
   cua-sample-app
 ```
 
-(Optional) Connect via VNC to observe.
+**(Optional)** In another terminal, connect with a VNC viewer to `localhost:5900` to observe.
 
-### 2. Launch the Orchestrator
+### 2. Launch the orchestrator
+
+From front_run folder:
+
 ```bash
 python -m front_run.orchestrator
 ```
 
 The orchestrator will:
-* Start the CUA.
-* Send the task prompt.
-* Trigger the attack at the right moment.
-* Apply IFC defences if enabled.
-* Log the full trace.
 
-## Extending the Framework
+- start the sample app CLI,
+- send the task: "explore CLOSED issues in GitHub for $TARGET_REPO …",
+- wait `PAUSE_AFTER_SECONDS`, then `docker pause` the container,
+- post the attack comment via GitHub API,
+- `docker unpause` the container and watch for visits to `$MALICIOUS_URL` in console output.
 
-* *New CUA deployments*: add a new adapter.
-* *New attacks*: implement another attacker agent.
-* *New defences*: define custom IFC policies.
-* *New signals*: add OCR, DOM, or model-output heuristics.
+Logs are written to `runs/<timestamp>/trace.jsonl`.
 
-This framework is intended as a *research and engineering testbed*, not a finished security solution.
+## How Pausing Works
 
-## Responsible Use
+We use `docker pause` / `docker unpause` to reliably stop and resume the CUA's process tree without modifying its code. This ensures the CUA does not progress while the front-runner posts the comment.
 
-Only run attacks on systems and repositories you own or have permission to test.
-This project is for security *research and defence development*, not exploitation.
+**Alternative**: If you prefer network gating instead of process pausing, swap this step for a firewall rule on the container's network.
+
+## Extending the PoC
+
+- **Better pause triggers**: Instead of a fixed sleep, watch stdout for a URL under `/issues` to pause exactly when the CUA reaches the issues list.
+
+- **Issue selection**: Replace the fallback with a heuristic (e.g., keyword match) against closed issues so the injected comment is likely on the page the CUA will open next.
+
+- **Observation hooks**: Add a lightweight HTTP server and point `MALICIOUS_URL` to it so you can log visits server-side (definitive confirmation of the visit).
+
+- **Rationale-free traces**: If the CUA emits a public plan JSON (e.g., `NEXT_TARGET_URLS`), parse and log those. Avoid attempts to access hidden chain-of-thought.
+
+## Notes
+
+- This PoC assumes the CUA CLI reads a single-line task from stdin. If your CLI uses a different interaction model, adapt `CUAClient.send_task` accordingly.
+
+- Use only on repositories you control. Posting misleading links to third-party repos is inappropriate and may violate terms of service.
