@@ -50,10 +50,11 @@ RUN pip install git+https://github.com/scottkirkwood/key-mon \
     echo '   return func_result'; \
     } | patch /home/myuser/.local/lib/python3.10/site-packages/keymon/key_mon.py
 
-# 5) Expose port 5900 and run Xvfb, x11vnc, Xfce (no login manager)
+    # 5) Expose port 5900 and run Xvfb, x11vnc, Xfce (no login manager)
+    # Xvfb :99 -screen 0 1280x800x24 >/dev/null 2>&1 & \
 EXPOSE 5900
 CMD ["/bin/sh", "-c", "\
-    Xvfb :99 -screen 0 1280x800x24 >/dev/null 2>&1 & \
+    Xvfb :99 -screen 0 1920x1080x24 >/dev/null 2>&1 & \
     x11vnc -display :99 -forever -rfbauth /home/myuser/.vncpass -listen 0.0.0.0 -rfbport 5900 >/dev/null 2>&1 & \
     export DISPLAY=:99 && \
     startxfce4 >/dev/null 2>&1 & \

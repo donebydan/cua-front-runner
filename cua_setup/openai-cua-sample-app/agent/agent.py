@@ -51,6 +51,9 @@ class Agent:
         if item["type"] == "message":
             if self.print_steps:
                 print(item["content"][0]["text"])
+        
+        if item["type"] == "computer_call":
+            print("TRACE_COMPUTER_CALL " + json.dumps(item))
 
         if item["type"] == "function_call":
             name, args = item["name"], json.loads(item["arguments"])
@@ -69,6 +72,7 @@ class Agent:
             ]
 
         if item["type"] == "computer_call":
+            print("TRACE_COMPUTER_CALL " + json.dumps(item))
             action = item["action"]
             action_type = action["type"]
             action_args = {k: v for k, v in action.items() if k != "type"}
@@ -140,6 +144,16 @@ class Agent:
                 # Print all the keys in the response for debugging
                 outs = response["output"][0]
                 print("Response keys:", outs)
+
+                try:
+                    print(
+                        "TRACE_MODEL_ITEM "
+                        + json.dumps(outs, ensure_ascii=False)
+                    )
+                except Exception:
+                    # don't break the agent if serialization fails
+                    pass
+
                 # Print reasoning summary if it exists
                 if "reasoning" in outs and "summary" in outs["reasoning"]:
                     print("\nReasoning Summary:")

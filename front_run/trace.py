@@ -37,6 +37,24 @@ class Trace:
         if ACTION_START in line:
             self._accum_action = "{"
             return
+        
+        prefix = "TRACE_MODEL_ITEM "
+        if line.startswith(prefix):
+            payload = line[len(prefix):]
+            try:
+                obj = json.loads(payload)
+            except Exception:
+                return
+            self.bus.emit("trace/model_item", item=obj)
+
+        elif line.startswith("TRACE_COMPUTER_CALL "):
+            payload = line[len("TRACE_COMPUTER_CALL "):]
+            try:
+                obj = json.loads(payload)
+            except Exception:
+                return
+            self.bus.emit("trace/computer_call", item=obj)
+
 
         if self._accum_action is not None:
             if line.strip() == "},":
