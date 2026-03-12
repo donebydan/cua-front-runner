@@ -48,6 +48,20 @@ To integrate a new CUA deployment, you only need to provide a thin adapter that:
 > * Browser agents → Playwright action listeners
 > * Desktop automation → OS-level input hooks
 
+#### Included Adapters
+
+| Adapter | Module | Controls |
+|---|---|---|
+| **Docker VM** | `front_run.docker_control.DockerControl` | A Docker container running a full desktop environment (VNC / Xvfb). |
+| **Playwright Browser** | `front_run.playwright_control.PlaywrightControl` | A headless (or headed) Chromium session managed by Playwright. |
+
+Both adapters expose the same interface (`pause`, `unpause`, `is_running`, `is_paused`) so the orchestrator can swap between them with a single import change.
+
+The Playwright adapter additionally provides:
+* `current_url()` — the URL the CUA is currently viewing.
+* `screenshot_b64()` — a base64-encoded viewport screenshot.
+* `inject_element(html)` — inject arbitrary HTML into the page (useful for visual injection attack simulation).
+
 
 ### 3. Event Bus
 
@@ -167,7 +181,10 @@ VERBOSE=1
 ⚠️ Security reminder: Never commit .env files.
 
 ## Running the Demo
-### 1. Start the CUA Container
+
+### Option A: Docker VM Adapter
+
+#### 1. Start the CUA Container
 ```bash
 docker run --rm -it --name cua-sample-app \
   -p 5900:5900 --dns=1.1.1.3 -e DISPLAY=:99 \
@@ -176,12 +193,29 @@ docker run --rm -it --name cua-sample-app \
 
 (Optional) Connect via VNC to observe.
 
-### 2. Launch the Orchestrator
+#### 2. Launch the Orchestrator
 ```bash
 python -m front_run.orchestrator
 ```
 
-The orchestrator will:
+### Option B: Playwright Browser Adapter
+
+#### 1. Install Playwright
+```bash
+pip install playwright
+python -m playwright install chromium
+```
+
+#### 2. Launch the Playwright Orchestrator
+```bash
+python -m front_run.orchestrator_playwright
+```
+
+This variant uses `PlaywrightControl` instead of `DockerControl`. No Docker container or VNC connection is needed — the CUA runs inside a local Chromium instance. The orchestrator can also poll the live browser URL directly as an additional signal for attack timing.
+
+---
+
+Both orchestrators will:
 * Start the CUA.
 * Send the task prompt.
 * Trigger the attack at the right moment.

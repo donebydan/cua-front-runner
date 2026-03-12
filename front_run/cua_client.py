@@ -15,15 +15,16 @@ class CUAClient:
     We send the task to stdin after the UI comes up.
     """
 
-    def __init__(self, bus: EventBus, cli_path: Optional[str] = None):
+    def __init__(self, bus: EventBus, cli_path: Optional[str] = None, computer: str = "docker"):
         self.bus = bus
         self.cli_path = cli_path or settings.cli_path
+        self.computer = computer
         self.proc: Optional[subprocess.Popen] = None
         self._reader_thread: Optional[threading.Thread] = None
 
 
     def start(self):
-        cmd = [sys.executable, self.cli_path, "--computer", "docker", "--debug"]
+        cmd = [sys.executable, self.cli_path, "--computer", self.computer, "--debug"]
         print(cmd)
         self.proc = subprocess.Popen(
             cmd,
